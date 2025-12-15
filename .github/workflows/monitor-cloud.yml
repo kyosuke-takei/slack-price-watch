@@ -37,4 +37,4 @@ jobs:
           SLACK_BATCH: "10"
           MAX_NOTIFY: "50"
           STRICT_FINDER: "on"
-          STRICT_CATEGORY_MATCH: "on"
+          STRICT_CATEGORY_MATCH: "off"
