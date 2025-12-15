@@ -8,9 +8,6 @@ on:
 jobs:
   run-monitor:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cloud
 
     steps:
       - uses: actions/checkout@v4
@@ -20,13 +17,13 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: cloud/package-lock.json
+          cache-dependency-path: package-lock.json
 
       - name: Install
         run: npm ci
 
-      - name: Run monitor (toys)
-        run: npm run monitor:toys
+      - name: Run monitor (same as local)
+        run: npm run monitor
         env:
           KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
@@ -36,5 +33,5 @@ jobs:
           FINDER_MAX_PAGES: "5"
           SLACK_BATCH: "10"
           MAX_NOTIFY: "50"
-          STRICT_FINDER: "off"
-          STRICT_CATEGORY_MATCH: "off"
+          STRICT_FINDER: "on"
+          STRICT_CATEGORY_MATCH: "on"
