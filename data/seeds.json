@@ -1,0 +1,406 @@
+// src/jobs/monitor.js
+import 'dotenv/config';
+import { keepaQuery, keepaProduct } from '../services/keepa.js';
+import { fileURLToPath } from 'url';
+import { basename } from 'path';
+
+/**
+ * 環境変数
+ */
+const {
+  KEEPA_API_KEY,
+  KEEPA_DOMAIN = '5',
+  SLACK_WEBHOOK_URL,
+
+  // Finder / 投稿系
+  FINDER_PER_PAGE = '100',
+  FINDER_MAX_PAGES = '3',
+  SLACK_BATCH = '10',
+  MAX_NOTIFY = '50',
+
+  // 追加クエリ トグル
+  ENABLE_PROFILE_637394 = 'on',
+  ENABLE_PROFILE_2277721051 = 'on',
+
+  // Keepa グラフ
+  KEEPA_GRAPH_IMAGE = 'off',
+  KEEPA_GRAPH_RANGE = '3', // 1,3,6,12,24 のような期間プリセット想定
+} = process.env;
+
+if (!KEEPA_API_KEY || !SLACK_WEBHOOK_URL) {
+  console.error('[monitor] Missing required env: KEEPA_API_KEY or SLACK_WEBHOOK_URL');
+  process.exit(1);
+}
+
+// 数値化
+const PER_PAGE = Number(FINDER_PER_PAGE) || 100;
+const MAX_PAGES = Number(FINDER_MAX_PAGES) || 3;
+const BATCH = Number(SLACK_BATCH) || 10;
+const LIMIT = Number(MAX_NOTIFY) || 50;
+const USE_GRAPH = (KEEPA_GRAPH_IMAGE || 'off').toLowerCase() === 'on';
+
+/**
+ * Finderクエリ
+ * 既存：おもちゃ 13299531 / SALES 1–10000 / 7日送料込 -15%〜-1000% / Amazon在庫切れ / NEW>=1000
+ * ※カテゴリ強制: categories_include / salesRankReference を数値IDで指定
+ */
+function buildFinderQuery(page = 0, perPage = PER_PAGE) {
+  const ROOT = 13299531;
+  return {
+    current_SALES_gte: 1,
+    current_SALES_lte: 10000,
+    rootCategory: [ROOT],
+    categories_include: [ROOT],
+    salesRankReference: ROOT,
+    deltaPercent7_BUY_BOX_SHIPPING_gte: -1000,
+    deltaPercent7_BUY_BOX_SHIPPING_lte: -15,
+    buyBoxStatsAmazon365_gte: 1,
+    buyBoxStatsAmazon365_lte: 100,
+    current_AMAZON_gte: -1,
+    current_AMAZON_lte: -1,
+    current_NEW_gte: 1000,
+    sort: [
+      ['current_SALES', 'asc'],
+      ['monthlySold', 'desc'],
+    ],
+    productType: [0, 1, 2],
+    perPage,
+    page,
+  };
+}
+
+/**
+ * 追加クエリ（その1）
+ * SALES 1–5000 / rootCategory 637394 / Amazon在庫切れ / NEWの7日変化 -15%〜-1000%
+ * ※カテゴリ強制
+ */
+function buildFinderQuery_cat637394(page = 0, perPage = PER_PAGE) {
+  const ROOT = 637394;
+  return {
+    current_SALES_gte: 1,
+    current_SALES_lte: 5000,
+    current_AMAZON_gte: -1,
+    current_AMAZON_lte: -1,
+    rootCategory: [ROOT],
+    categories_include: [ROOT],
+    salesRankReference: ROOT,
+    buyBoxStatsAmazon365_gte: 1,
+    buyBoxStatsAmazon365_lte: 100,
+    deltaPercent7_NEW_gte: -1000,
+    deltaPercent7_NEW_lte: -15,
+    sort: [
+      ['current_SALES', 'asc'],
+      ['monthlySold', 'desc'],
+    ],
+    productType: [0, 1, 2],
+    perPage,
+    page,
+  };
+}
+
+/**
+ * 追加クエリ（その2）
+ * SALES 1–10000 / rootCategory 2277721051 / Amazon在庫切れ / NEW>=1000 / NEWの7日変化 -15%〜-1000%
+ * ※カテゴリ強制
+ */
+function buildFinderQuery_cat2277721051(page = 0, perPage = PER_PAGE) {
+  const ROOT = 2277721051;
+  return {
+    current_SALES_gte: 1,
+    current_SALES_lte: 10000,
+    current_AMAZON_gte: -1,
+    current_AMAZON_lte: -1,
+    rootCategory: [ROOT],
+    categories_include: [ROOT],
+    salesRankReference: ROOT,
+    buyBoxStatsAmazon365_gte: 1,
+    buyBoxStatsAmazon365_lte: 100,
+    deltaPercent7_NEW_gte: -1000,
+    deltaPercent7_NEW_lte: -15,
+    current_NEW_gte: 1000,
+    sort: [
+      ['current_SALES', 'asc'],
+      ['monthlySold', 'desc'],
+    ],
+    productType: [0, 1, 2],
+    perPage,
+    page,
+  };
+}
+
+/**
+ * プロファイル配列（[builder, tag, allowedRootCategoryId]）
+ * 追加クエリは ENV でON/OFF
+ */
+const FINDER_PROFILES = [
+  [(page) => buildFinderQuery(page), '🧸 Toys(13299531)', 13299531],
+  ...(ENABLE_PROFILE_637394.toLowerCase() === 'on'
+    ? [[(page) => buildFinderQuery_cat637394(page), '🎮 637394', 637394]]
+    : []),
+  ...(ENABLE_PROFILE_2277721051.toLowerCase() === 'on'
+    ? [[(page) => buildFinderQuery_cat2277721051(page), '📚 2277721051', 2277721051]]
+    : []),
+];
+
+/**
+ * ユーティリティ
+ */
+const yen = (v) =>
+  typeof v === 'number' && isFinite(v) ? `¥${Math.round(v).toLocaleString('ja-JP')}` : '-';
+const pct = (v) =>
+  typeof v === 'number' && isFinite(v) ? `${v > 0 ? '+' : ''}${v.toFixed(1)}%` : '-';
+const centsToYen = (v) => (typeof v === 'number' && v >= 0 ? v / 100 : null);
+
+function calcPrice7DaysAgo(current, deltaPercent7) {
+  if (typeof current !== 'number' || !isFinite(current)) return null;
+  if (typeof deltaPercent7 !== 'number' || !isFinite(deltaPercent7)) return null;
+  const denom = 1 + deltaPercent7 / 100;
+  if (denom === 0) return null;
+  return current / denom;
+}
+
+const amazonUrl = (asin) => `https://www.amazon.co.jp/dp/${asin}`;
+const keepaUrl = (asin, domain = KEEPA_DOMAIN) => `https://keepa.com/#!product/${domain}-${asin}`;
+
+/**
+ * Keepa グラフ画像 URL（Graph Image API）
+ */
+function buildKeepaGraphImageUrl(
+  asin,
+  { domainId = Number(KEEPA_DOMAIN) || 5, range = String(KEEPA_GRAPH_RANGE || '3') } = {}
+) {
+  const params = new URLSearchParams({
+    asin,
+    domain: String(domainId),
+    range,
+    salesrank: '1',
+    buybox: '1',
+    amazon: '1',
+    new: '1',
+    used: '0',
+    width: '1200',
+    height: '600',
+  });
+  return `https://graph.keepa.com/pricehistory.png?${params.toString()}`;
+}
+
+/**
+ * Slack 投稿
+ */
+async function postToSlack(blocks, fallbackText = 'Keepa Monitor Notification') {
+  const payload = { text: fallbackText, blocks };
+  const res = await fetch(SLACK_WEBHOOK_URL, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => '');
+    throw new Error(`[monitor] Slack post failed: ${res.status} ${res.statusText} ${txt}`);
+  }
+}
+
+/**
+ * Slack 表示整形：Amazon/Keepaリンク、ランク/現在価格(送料込)/7日前価格/7日変化/在庫/BuyBox
+ */
+function productToBlock(p) {
+  const asin = p.asin;
+  const title = p.title || p.productTitle || '(No title)';
+  const stats = p.stats || {};
+  const current = stats.current || {};
+  const delta7 = stats.deltaPercent7 || {};
+
+  const rank = current.SALES ?? current.SALESr ?? null;
+
+  // 送料込み優先: BUY_BOX_SHIPPING -> BUY_BOX
+  const currentWithShipCents = current.BUY_BOX_SHIPPING ?? null;
+  const currentWithShip = centsToYen(currentWithShipCents);
+  const currentBBOnly = centsToYen(current.BUY_BOX ?? -1);
+  const displayCurrent = currentWithShip ?? currentBBOnly;
+
+  // 7日変化（送料込みに準拠）
+  const delta7Ship =
+    typeof delta7.BUY_BOX_SHIPPING === 'number' ? delta7.BUY_BOX_SHIPPING : null;
+
+  // 7日前価格（送料込みのデルタ％から逆算）
+  const baseForPrev = displayCurrent ?? null;
+  const prev7Price =
+    baseForPrev != null && delta7Ship != null
+      ? calcPrice7DaysAgo(baseForPrev, delta7Ship)
+      : null;
+
+  // 在庫（Amazon在庫切れ）
+  const amazonOOS = current.AMAZON === -1;
+  const stockLabel = amazonOOS ? 'Amazon在庫切れ' : 'Amazon在庫あり';
+
+  // BuyBoxの参考表示
+  const bbPrice = centsToYen(current.BUY_BOX ?? -1);
+  const bbShipIncl = centsToYen(current.BUY_BOX_SHIPPING ?? -1);
+
+  const lines = [];
+  lines.push(`*<${amazonUrl(asin)}|Amazon> / <${keepaUrl(asin)}|Keepa>*`);
+  lines.push(`*${title}* (ASIN: \`${asin}\`)`);
+  lines.push(`• ランク: ${rank ?? '-'}`);
+  lines.push(`• 現在価格(送料込): ${yen(displayCurrent)}`);
+  lines.push(`• 7日前価格: ${yen(prev7Price)}`);
+  lines.push(`• 7日変化: ${pct(delta7Ship ?? NaN)}`);
+  lines.push(`• 在庫: ${stockLabel}`);
+  lines.push(
+    `• BuyBox: ${bbShipIncl != null ? yen(bbShipIncl) : '-'}${
+      bbPrice != null ? `（本体: ${yen(bbPrice)}）` : ''
+    }`
+  );
+
+  return {
+    type: 'section',
+    text: { type: 'mrkdwn', text: lines.join('\n') },
+  };
+}
+
+/**
+ * Slack 1バッチ分のBlocks生成（カテゴリ名タグ付き、画像オプション）
+ */
+function buildBatchBlocks(products, batchIndex = 0) {
+  const tagSet = new Set(products.map((p) => p.__tag || ''));
+  const tagLabel = tagSet.size === 1 ? [...tagSet][0] : '🧩 Mixed';
+
+  const header = {
+    type: 'header',
+    text: {
+      type: 'plain_text',
+      text: `Keepa Monitor ${tagLabel} - Batch ${batchIndex + 1}`,
+      emoji: true,
+    },
+  };
+  const divider = { type: 'divider' };
+  const blocks = [header, divider];
+
+  for (const p of products) {
+    blocks.push(productToBlock(p));
+
+    if (USE_GRAPH) {
+      const imgUrl = buildKeepaGraphImageUrl(p.asin);
+      blocks.push({
+        type: 'image',
+        image_url: imgUrl,
+        alt_text: `Keepa Graph ${p.asin}`,
+      });
+    }
+    blocks.push(divider);
+  }
+  if (blocks[blocks.length - 1] === divider) blocks.pop();
+  return blocks;
+}
+
+/**
+ * /query → ASIN収集（全プロファイル横断, タグ保持）
+ * keepaQuery は「{ selection: ... }」を POST ボディに受け取る実装
+ */
+async function collectAsins() {
+  const items = []; // { asin, tag }
+  const seen = new Set();
+
+  for (const [build, tag] of FINDER_PROFILES) {
+    for (let page = 0; page < MAX_PAGES; page++) {
+      const body = build(page);
+      const res = await keepaQuery({ selection: body });
+
+      const pageAsins =
+        res?.asinList ??
+        res?.results?.asinList ??
+        res?.products?.map((x) => x.asin) ??
+        [];
+
+      for (const asin of pageAsins) {
+        if (!asin || seen.has(asin)) continue;
+        seen.add(asin);
+        items.push({ asin, tag });
+        if (items.length >= LIMIT) break;
+      }
+      if (items.length >= LIMIT || pageAsins.length === 0) break;
+    }
+    if (items.length >= LIMIT) break;
+  }
+
+  return items.slice(0, LIMIT); // [{ asin, tag }]
+}
+
+/**
+ * /product → 詳細取得（100件チャンク、タグ復元 & 最終カテゴリフィルタ）
+ * keepaProduct(asins) は products を返す実装（stats=180 は keepa.js 側）
+ */
+async function fetchProducts(asinWithTags) {
+  const chunkSize = 100;
+  const products = [];
+  for (let i = 0; i < asinWithTags.length; i += chunkSize) {
+    const chunk = asinWithTags.slice(i, i + chunkSize);
+    const asins = chunk.map((x) => x.asin);
+    const list = await keepaProduct(asins); // keepa.js が stats=180 を付与
+    for (const p of list) {
+      if (!p?.asin) continue;
+
+      // タグ復元
+      const tagged = chunk.find((x) => x.asin === p.asin);
+      const tag = tagged?.tag || '';
+
+      // ✅ 最終フィルタ：想定rootカテゴリと一致するもののみ採用
+      const allowedRoot = FINDER_PROFILES.find((fp) => fp[1] === tag)?.[2]; // 3番目がallowed root
+      if (typeof allowedRoot === 'number' && p.rootCategory !== allowedRoot) continue;
+
+      products.push({ ...p, __tag: tag });
+    }
+  }
+  return products;
+}
+
+/**
+ * メイン処理
+ */
+export async function runMonitor() {
+  console.log('[monitor] start');
+
+  const asinWithTags = await collectAsins();
+  if (!asinWithTags.length) {
+    console.log('[monitor] no ASINs found by /query conditions');
+    return;
+  }
+  console.log(`[monitor] collected ASINs: ${asinWithTags.length}`);
+
+  const products = await fetchProducts(asinWithTags);
+  console.log(`[monitor] fetched products: ${products.length}`);
+
+  if (!products.length) {
+    console.log('[monitor] no product details fetched');
+    return;
+  }
+
+  // バッチ分割してSlack投稿
+  for (let i = 0; i < products.length; i += BATCH) {
+    const slice = products.slice(i, i + BATCH);
+    const blocks = buildBatchBlocks(slice, i / BATCH);
+    await postToSlack(blocks, `Keepa Monitor - ${slice.length} items`);
+    console.log(`[monitor] posted batch ${Math.floor(i / BATCH) + 1}`);
+  }
+
+  console.log('[monitor] done');
+}
+
+/**
+ * 直接実行
+ */
+const isDirect = (() => {
+  try {
+    const invoked = process.argv[1] && basename(process.argv[1]);
+    const self = basename(fileURLToPath(import.meta.url));
+    return invoked === self;
+  } catch {
+    return false;
+  }
+})();
+
+if (isDirect) {
+  runMonitor().catch((err) => {
+    console.error('[monitor] fatal:', err);
+    process.exit(1);
+  });
+}

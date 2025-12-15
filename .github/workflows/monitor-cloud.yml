@@ -1,0 +1,31 @@
+name: Slack Price Monitor (cloud)
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run-monitor:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: cloud/package-lock.json
+
+      - name: Install
+        run: npm ci
+
+      - name: Run monitor (toys)
+        run: npm run monitor:toys
+        env:
+          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
