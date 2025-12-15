@@ -1,14 +1,18 @@
-name: Slack Price Monitor
+name: Slack Price Monitor (rotating)
 
 on:
   schedule:
-    - cron: "0 0 * * *"   # 09:00 JST
-    - cron: "0 6 * * *"   # 15:00 JST
-    - cron: "0 12 * * *"  # 21:00 JST
+    # GitHub Actions cron is UTC. JST = UTC+9
+    # 09:00 JST -> 00:00 UTC
+    # 15:00 JST -> 06:00 UTC
+    # 20:00 JST -> 11:00 UTC
+    - cron: "0 0 * * *"
+    - cron: "0 6 * * *"
+    - cron: "0 11 * * *"
   workflow_dispatch:
 
 jobs:
-  run-monitor:
+  run-rotating-monitor:
     runs-on: ubuntu-latest
 
     steps:
@@ -24,9 +28,44 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Run monitor (all profiles)
-        run: npm run monitor
+      # JST基準で「今日のジャンル」を決める：hobby -> toys -> games -> (繰り返し)
+      - name: Decide profile for today (JST)
+        shell: bash
+        run: |
+          DAY=$(TZ=Asia/Tokyo date +%j)   # 001..365/366
+          IDX=$((10#$DAY % 3))           # 0..2
+          if [ "$IDX" = "0" ]; then echo "PROFILE=hobby" >> $GITHUB_ENV; fi
+          if [ "$IDX" = "1" ]; then echo "PROFILE=toys"  >> $GITHUB_ENV; fi
+          if [ "$IDX" = "2" ]; then echo "PROFILE=games" >> $GITHUB_ENV; fi
+
+          # 1回の通知上限（=30件）
+          echo "MAX_NOTIFY=30" >> $GITHUB_ENV
+
+          echo "Today(JST day-of-year=$DAY) -> PROFILE=$PROFILE"
+
+      # 実行（PROFILEに応じて 1つだけ動かす）
+      - name: Run monitor (rotating)
+        shell: bash
+        run: |
+          echo "Running profile=$PROFILE"
+          if [ "$PROFILE" = "hobby" ]; then
+            npm run monitor:hobby
+          elif [ "$PROFILE" = "toys" ]; then
+            npm run monitor:toys
+          elif [ "$PROFILE" = "games" ]; then
+            npm run monitor:games
+          else
+            echo "Unknown PROFILE=$PROFILE"
+            exit 1
+          fi
         env:
           KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+          # 既存の挙動パラメータも必要ならここで渡す（ローカルと同じにしたい場合）
+          FINDER_PER_PAGE: "100"
+          FINDER_MAX_PAGES: "5"
+          SLACK_BATCH: "10"
+          STRICT_FINDER: "on"
+          STRICT_CATEGORY_MATCH: "on"
