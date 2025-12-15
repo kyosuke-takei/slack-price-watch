@@ -36,5 +36,5 @@ jobs:
           FINDER_MAX_PAGES: "5"
           SLACK_BATCH: "10"
           MAX_NOTIFY: "50"
-          STRICT_FINDER: "on"
+          STRICT_FINDER: "off"
           STRICT_CATEGORY_MATCH: "off"
