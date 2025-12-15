@@ -1,4 +1,4 @@
-name: Slack Price Monitor (cloud)
+name: Slack Price Monitor
 
 on:
   schedule:
@@ -22,16 +22,9 @@ jobs:
       - name: Install
         run: npm ci
 
-      - name: Run monitor (same as local)
+      - name: Run monitor (all profiles)
         run: npm run monitor
         env:
           KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-
-          FINDER_PER_PAGE: "100"
-          FINDER_MAX_PAGES: "5"
-          SLACK_BATCH: "10"
-          MAX_NOTIFY: "50"
-          STRICT_FINDER: "on"
-          STRICT_CATEGORY_MATCH: "on"
