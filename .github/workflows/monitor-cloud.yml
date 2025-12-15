@@ -28,4 +28,6 @@ jobs:
       - name: Run monitor (toys)
         run: npm run monitor:toys
         env:
-          SLACK_TOKEN: ${{ secrets.SLACK_TOKEN }}
+          KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
+          KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
