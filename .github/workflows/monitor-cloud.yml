@@ -25,10 +25,10 @@ jobs:
           cache: "npm"
           cache-dependency-path: package-lock.json
 
-      - name: Install
+      - name: Install (root)
         run: npm ci
+        working-directory: .
 
-      # JST基準で「今日のジャンル」を決める：hobby -> toys -> games -> (繰り返し)
       - name: Decide profile for today (JST)
         shell: bash
         run: |
@@ -38,14 +38,13 @@ jobs:
           if [ "$IDX" = "1" ]; then echo "PROFILE=toys"  >> $GITHUB_ENV; fi
           if [ "$IDX" = "2" ]; then echo "PROFILE=games" >> $GITHUB_ENV; fi
 
-          # 1回の通知上限（=30件）
           echo "MAX_NOTIFY=30" >> $GITHUB_ENV
 
           echo "Today(JST day-of-year=$DAY) -> PROFILE=$PROFILE"
 
-      # 実行（PROFILEに応じて 1つだけ動かす）
-      - name: Run monitor (rotating)
+      - name: Run monitor (rotating, root)
         shell: bash
+        working-directory: .
         run: |
           echo "Running profile=$PROFILE"
           if [ "$PROFILE" = "hobby" ]; then
@@ -63,9 +62,9 @@ jobs:
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
 
-          # 既存の挙動パラメータも必要ならここで渡す（ローカルと同じにしたい場合）
           FINDER_PER_PAGE: "100"
           FINDER_MAX_PAGES: "5"
           SLACK_BATCH: "10"
+          MAX_NOTIFY: "30"
           STRICT_FINDER: "on"
           STRICT_CATEGORY_MATCH: "on"
