@@ -14,6 +14,9 @@ on:
 jobs:
   run-rotating-monitor:
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: cloud
 
     steps:
       - uses: actions/checkout@v4
@@ -23,37 +26,37 @@ jobs:
         with:
           node-version: "22"
           cache: "npm"
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: cloud/package-lock.json
 
       - name: Install
         run: npm ci
 
+      # JST基準で「今日のジャンル」を決める：hobby -> toys -> games -> hobby -> ...
       - name: Decide profile for today (JST)
         shell: bash
         run: |
-          DAY=$(TZ=Asia/Tokyo date +%j)   # 001..365/366
-          IDX=$((10#$DAY % 3))           # 0..2
-          if [ "$IDX" = "0" ]; then echo "PROFILE=hobby" >> $GITHUB_ENV; fi
-          if [ "$IDX" = "1" ]; then echo "PROFILE=toys"  >> $GITHUB_ENV; fi
-          if [ "$IDX" = "2" ]; then echo "PROFILE=games" >> $GITHUB_ENV; fi
+          DAY=$(TZ=Asia/Tokyo date +%j)     # 001..365/366
+          IDX=$((10#$DAY % 4))             # 0..3
 
-          # 1回の通知上限（30件）
+          PROFILE=""
+          if [ "$IDX" = "0" ]; then PROFILE="hobby"; fi
+          if [ "$IDX" = "1" ]; then PROFILE="toys";  fi
+          if [ "$IDX" = "2" ]; then PROFILE="games"; fi
+          if [ "$IDX" = "3" ]; then PROFILE="hobby"; fi
+
+          echo "PROFILE=$PROFILE" >> $GITHUB_ENV
+
+          # 1回30件（=各プロファイルlimitを30に上書き）
+          echo "PROFILE_LIMIT=30" >> $GITHUB_ENV
           echo "MAX_NOTIFY=30" >> $GITHUB_ENV
+
+          echo "Today(JST day-of-year=$DAY idx=$IDX) -> PROFILE=$PROFILE"
 
       - name: Run monitor (rotating)
         shell: bash
         run: |
-          echo "Running profile=$PROFILE"
-          if [ "$PROFILE" = "hobby" ]; then
-            npm run monitor:hobby
-          elif [ "$PROFILE" = "toys" ]; then
-            npm run monitor:toys
-          elif [ "$PROFILE" = "games" ]; then
-            npm run monitor:games
-          else
-            echo "Unknown PROFILE=$PROFILE"
-            exit 1
-          fi
+          echo "Running ONLY_PROFILE=$PROFILE"
+          ONLY_PROFILE="$PROFILE" npm run monitor
         env:
           KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
@@ -61,9 +64,6 @@ jobs:
 
           FINDER_PER_PAGE: "100"
           FINDER_MAX_PAGES: "5"
-          SLACK_BATCH: "10"
-          MAX_NOTIFY: ${{ env.MAX_NOTIFY }}
-
-          # ★重要：games(637394)だけ strict を外す（0件化を防ぐ）
-          STRICT_FINDER: ${{ env.PROFILE == 'games' && 'off' || 'on' }}
-          STRICT_CATEGORY_MATCH: ${{ env.PROFILE == 'games' && 'off' || 'on' }}
+          SLACK_BATCH: "3"
+          STRICT_FINDER: "on"
+          STRICT_CATEGORY_MATCH: "on"

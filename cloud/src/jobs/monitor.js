@@ -1,6 +1,8 @@
-// src/jobs/monitor.js
+// cloud/src/jobs/monitor.js
 // Keepa Finder → Product → Slack 通知ジョブ
 // カテゴリ: おもちゃ / ゲーム / ホビー
+// ★ ONLY_PROFILE で 1ジャンルだけ実行できるように拡張
+// ★ PROFILE_LIMIT で 1回の通知件数(=各プロファイルlimit)を上書きできるように拡張
 
 import "dotenv/config";
 import {
@@ -19,6 +21,12 @@ const FINDER_MAX_PAGES = numEnv("FINDER_MAX_PAGES", 5);
 const SLACK_BATCH = clamp(numEnv("SLACK_BATCH", 3), 1, 3);
 const MAX_NOTIFY = numEnv("MAX_NOTIFY", 50);
 
+// ★ 1プロファイルの通知上限を env で上書き（ローテ運用は 30 推奨）
+const PROFILE_LIMIT = numEnv("PROFILE_LIMIT", 10);
+
+// ★ どれか1ジャンルだけ動かす（例: toys / games / hobby）
+const ONLY_PROFILE_RAW = (process.env.ONLY_PROFILE || "").trim().toLowerCase();
+
 const GRAPH_IMAGE =
   (process.env.KEEPA_GRAPH_IMAGE || "on").toLowerCase() === "on";
 const GRAPH_RANGE = numEnv("KEEPA_GRAPH_RANGE", 3);
@@ -30,23 +38,27 @@ const GRAPH_FULL_HEIGHT = numEnv("KEEPA_GRAPH_FULL_HEIGHT", 800);
 const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5); // 5 = JP
 
 // ===== プロファイル定義 =====
+// ★ key を追加（ローテ・ONLY_PROFILE用）
 const PROFILES = [
   {
+    key: "toys",
     name: "おもちゃ",
     rootCategory: 13299531,
-    limit: 10,
+    limit: PROFILE_LIMIT,
     excludeDigital: false,
   },
   {
+    key: "games",
     name: "ゲーム",
     rootCategory: 637394,
-    limit: 10,
+    limit: PROFILE_LIMIT,
     excludeDigital: true,
   },
   {
+    key: "hobby",
     name: "ホビー",
     rootCategory: 2277721051,
-    limit: 10,
+    limit: PROFILE_LIMIT,
     excludeDigital: false,
   },
 ];
@@ -187,7 +199,7 @@ function buildItemView(product) {
     priceNow,
     amazonUrl,
     keepaUrl,
-    imageUrl, // ★ 追加
+    imageUrl,
     thumbGraphUrl,
     fullGraphUrl,
   };
@@ -198,7 +210,6 @@ async function fetchAsinsForProfile(profile) {
   const asins = [];
   let page = 0;
 
-  // ★ limit に依存せず、「ページ数上限まで」ガッツリ拾う
   while (page < FINDER_MAX_PAGES) {
     const payload = {
       domainId: DOMAIN,
@@ -241,7 +252,6 @@ function buildBlocksForProfile(profileName, items) {
   };
 
   const divider = { type: "divider" };
-
   const blocks = [header, divider];
 
   for (const item of items) {
@@ -250,57 +260,35 @@ function buildBlocksForProfile(profileName, items) {
     lines.push(item.title || "(no title)");
     lines.push("");
 
-    // 【新品価格】
     lines.push("【新品価格】");
-    lines.push(
-      `新品価格：${
-        item.priceNow != null ? yen(item.priceNow) : "-"
-      }`
-    );
+    lines.push(`新品価格：${item.priceNow != null ? yen(item.priceNow) : "-"}`);
     lines.push("");
 
-    // 【出品者数】
     lines.push("【出品者数】");
-    lines.push(
-      `出品者数：${
-        item.offerCount != null ? item.offerCount : "-"
-      }名`
-    );
+    lines.push(`出品者数：${item.offerCount != null ? item.offerCount : "-"}名`);
     lines.push("");
 
-    // 【ランキング】
     lines.push("【ランキング】");
     lines.push(`ランキング順位：${item.salesRank ?? "-"}位`);
     lines.push(
-      `直近30日販売数：${
-        item.monthlySold != null ? item.monthlySold : "-"
-      }個`
+      `直近30日販売数：${item.monthlySold != null ? item.monthlySold : "-"}個`
     );
     lines.push("");
 
-    // 【Amazon商品URL】
     lines.push("【Amazon商品URL】");
     lines.push(item.amazonUrl);
     lines.push("");
 
-    // 【Keepa詳細URL】
     lines.push("【Keepa詳細URL】");
     lines.push(item.keepaUrl);
 
     const section = {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: lines.join("\n"),
-      },
+      text: { type: "mrkdwn", text: lines.join("\n") },
     };
 
-    // ★ 商品画像をアクセサリとして表示（テキストの右側にサムネ）
     if (item.imageUrl) {
-      const altText = (item.title || item.asin || "")
-        .replace(/\s+/g, " ")
-        .slice(0, 80);
-
+      const altText = (item.title || item.asin || "").replace(/\s+/g, " ").slice(0, 80);
       section.accessory = {
         type: "image",
         image_url: item.imageUrl,
@@ -310,12 +298,8 @@ function buildBlocksForProfile(profileName, items) {
 
     blocks.push(section);
 
-    // Keepaグラフ画像は別の image ブロックで下に表示
     if (GRAPH_IMAGE && item.thumbGraphUrl) {
-      const altTextGraph = (item.title || item.asin || "")
-        .replace(/\s+/g, " ")
-        .slice(0, 80);
-
+      const altTextGraph = (item.title || item.asin || "").replace(/\s+/g, " ").slice(0, 80);
       blocks.push({
         type: "image",
         image_url: item.thumbGraphUrl,
@@ -338,21 +322,12 @@ async function sendProfileToSlack(profileName, items) {
   for (const group of groupChunks) {
     const firstTitle = normalizeTitle(group[0].title);
     const blocks = buildBlocksForProfile(profileName, group);
-    const textFallback = `${profileName}: ${firstTitle.slice(
-      0,
-      60
-    )} ほか${group.length}件`;
+    const textFallback = `${profileName}: ${firstTitle.slice(0, 60)} ほか${group.length}件`;
 
     try {
-      await slack({
-        text: textFallback,
-        blocks,
-      });
+      await slack({ text: textFallback, blocks });
     } catch (err) {
-      log(
-        `Slack group post failed (${profileName}, size=${group.length}):`,
-        err.message || err
-      );
+      log(`Slack group post failed (${profileName}, size=${group.length}):`, err.message || err);
 
       // フォールバック：1件ずつ送信
       for (const item of group) {
@@ -361,15 +336,9 @@ async function sendProfileToSlack(profileName, items) {
         const singleText = `${profileName}: ${singleTitle.slice(0, 60)}`;
 
         try {
-          await slack({
-            text: singleText,
-            blocks: singleBlocks,
-          });
+          await slack({ text: singleText, blocks: singleBlocks });
         } catch (err2) {
-          log(
-            `Slack single post failed (${profileName}, asin=${item.asin}):`,
-            err2.message || err2
-          );
+          log(`Slack single post failed (${profileName}, asin=${item.asin}):`, err2.message || err2);
         }
       }
     }
@@ -390,8 +359,10 @@ async function processProfile(profile, remainingNotify) {
   const asinChunks = chunk(asins, 20);
   const picked = [];
 
+  const cap = Math.min(profile.limit, remainingNotify);
+
   for (const ch of asinChunks) {
-    if (picked.length >= remainingNotify) break;
+    if (picked.length >= cap) break;
 
     let res;
     try {
@@ -415,19 +386,14 @@ async function processProfile(profile, remainingNotify) {
       // Amazon 在庫があるもの（amazonPrice>0）は除外
       if (basics.amazonPrice && basics.amazonPrice > 0) continue;
 
-      // ★ 過去の総出品者数が 3 未満の商品は除外
+      // 過去の総出品者数が 3 未満の商品は除外
       const totalOfferCount = getTotalOfferCount(stats);
       if (totalOfferCount == null || totalOfferCount < 3) continue;
 
       const view = buildItemView(p);
       picked.push(view);
 
-      if (
-        picked.length >= profile.limit ||
-        picked.length >= remainingNotify
-      ) {
-        break;
-      }
+      if (picked.length >= cap) break;
     }
   }
 
@@ -442,12 +408,28 @@ async function processProfile(profile, remainingNotify) {
   return picked.length;
 }
 
+function selectProfiles() {
+  if (!ONLY_PROFILE_RAW) return PROFILES;
+
+  // toys/games/hobby のkeyで指定
+  const one = PROFILES.filter((p) => p.key === ONLY_PROFILE_RAW);
+  if (one.length) return one;
+
+  // 「おもちゃ」「ゲーム」「ホビー」指定でも動くように保険
+  const jp = PROFILES.filter((p) => p.name === ONLY_PROFILE_RAW);
+  if (jp.length) return jp;
+
+  log(`WARN: Unknown ONLY_PROFILE="${ONLY_PROFILE_RAW}". Run all profiles.`);
+  return PROFILES;
+}
+
 async function main() {
-  log("monitor START");
+  log("monitor START", ONLY_PROFILE_RAW ? `(ONLY_PROFILE=${ONLY_PROFILE_RAW})` : "");
 
   let remaining = MAX_NOTIFY;
 
-  for (const profile of PROFILES) {
+  const targets = selectProfiles();
+  for (const profile of targets) {
     if (remaining <= 0) break;
     const used = await processProfile(profile, remaining);
     remaining -= used;
