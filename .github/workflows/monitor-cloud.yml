@@ -25,9 +25,8 @@ jobs:
           cache: "npm"
           cache-dependency-path: package-lock.json
 
-      - name: Install (root)
+      - name: Install
         run: npm ci
-        working-directory: .
 
       - name: Decide profile for today (JST)
         shell: bash
@@ -38,13 +37,11 @@ jobs:
           if [ "$IDX" = "1" ]; then echo "PROFILE=toys"  >> $GITHUB_ENV; fi
           if [ "$IDX" = "2" ]; then echo "PROFILE=games" >> $GITHUB_ENV; fi
 
+          # 1回の通知上限（30件）
           echo "MAX_NOTIFY=30" >> $GITHUB_ENV
 
-          echo "Today(JST day-of-year=$DAY) -> PROFILE=$PROFILE"
-
-      - name: Run monitor (rotating, root)
+      - name: Run monitor (rotating)
         shell: bash
-        working-directory: .
         run: |
           echo "Running profile=$PROFILE"
           if [ "$PROFILE" = "hobby" ]; then
@@ -65,6 +62,8 @@ jobs:
           FINDER_PER_PAGE: "100"
           FINDER_MAX_PAGES: "5"
           SLACK_BATCH: "10"
-          MAX_NOTIFY: "30"
-          STRICT_FINDER: "on"
-          STRICT_CATEGORY_MATCH: "on"
+          MAX_NOTIFY: ${{ env.MAX_NOTIFY }}
+
+          # ★重要：games(637394)だけ strict を外す（0件化を防ぐ）
+          STRICT_FINDER: ${{ env.PROFILE == 'games' && 'off' || 'on' }}
+          STRICT_CATEGORY_MATCH: ${{ env.PROFILE == 'games' && 'off' || 'on' }}
