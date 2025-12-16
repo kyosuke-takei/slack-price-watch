@@ -7,7 +7,9 @@
     "monitor:toys": "node src/jobs/monitor_toys.js",
     "monitor:637394": "node src/jobs/monitor_637394.js",
     "monitor:books": "node src/jobs/monitor_2277721051.js",
-    "monitor": "node src/jobs/monitor.js"
+    "monitor": "node src/jobs/monitor.js",
+    "monitor:games": "npm run monitor:637394",
+    "monitor:hobby": "node src/jobs/monitor_hobby.js"
   },
   "dependencies": {
     "dotenv": "^16.6.1"
