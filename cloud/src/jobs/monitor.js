@@ -1,6 +1,5 @@
-// src/jobs/monitor.js
-// Keepa Finder → Product → Slack 通知
-// ✅ 商品画像あり / ❌ Keepaグラフなし / 独自Slackレイアウト
+// cloud/src/jobs/monitor.js
+// 商品画像あり / Keepaグラフなし / ボタンは商品名の下
 
 import "dotenv/config";
 import {
@@ -11,16 +10,16 @@ import {
 import { slack } from "../services/slack.js";
 
 /* =====================
-   環境変数
+   env
 ===================== */
 const FINDER_PER_PAGE = Number(process.env.FINDER_PER_PAGE || 100);
 const FINDER_MAX_PAGES = Number(process.env.FINDER_MAX_PAGES || 5);
 const SLACK_BATCH = Math.min(Math.max(Number(process.env.SLACK_BATCH || 3), 1), 3);
 const MAX_NOTIFY = Number(process.env.MAX_NOTIFY || 30);
-const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5); // JP
+const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5);
 
 /* =====================
-   プロファイル定義
+   profiles
 ===================== */
 const PROFILES = [
   { name: "おもちゃ", rootCategory: 13299531, limit: 30, excludeDigital: false },
@@ -28,15 +27,10 @@ const PROFILES = [
   { name: "ホビー", rootCategory: 2277721051, limit: 30, excludeDigital: false },
 ];
 
-const DIGITAL_KEYWORDS = [
-  "ダウンロード",
-  "オンラインコード",
-  "download",
-  "digital",
-];
+const DIGITAL_KEYWORDS = ["ダウンロード", "オンラインコード", "download", "digital"];
 
 /* =====================
-   util
+   utils
 ===================== */
 const log = (...a) => console.log(new Date().toISOString(), ...a);
 
@@ -45,24 +39,19 @@ const yen = (v) =>
     ? `¥${Number(v).toLocaleString("ja-JP")}`
     : "-";
 
-const isDigitalTitle = (title = "") =>
-  DIGITAL_KEYWORDS.some((k) =>
-    title.toLowerCase().includes(k.toLowerCase())
-  );
+const isDigitalTitle = (t = "") =>
+  DIGITAL_KEYWORDS.some((k) => t.toLowerCase().includes(k.toLowerCase()));
 
 const chunk = (arr, size) =>
   Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
     arr.slice(i * size, i * size + size)
   );
 
-// 商品画像URL（Amazon CDN）
-function getImageUrl(product) {
-  const csv = product?.imagesCSV;
+function getImageUrl(p) {
+  const csv = p?.imagesCSV;
   if (!csv) return null;
   const id = csv.split(",")[0];
-  return id
-    ? `https://m.media-amazon.com/images/I/${id}.jpg`
-    : null;
+  return id ? `https://m.media-amazon.com/images/I/${id}.jpg` : null;
 }
 
 /* =====================
@@ -87,7 +76,6 @@ async function fetchAsins(profile) {
     for (const asin of list) {
       if (!asins.includes(asin)) asins.push(asin);
     }
-
     if (list.length < FINDER_PER_PAGE) break;
   }
 
@@ -95,29 +83,22 @@ async function fetchAsins(profile) {
 }
 
 /* =====================
-   Slack Blocks
+   Slack blocks
 ===================== */
 function buildBlocks(profileName, items) {
   const blocks = [
-    {
-      type: "header",
-      text: { type: "plain_text", text: profileName },
-    },
+    { type: "header", text: { type: "plain_text", text: profileName } },
     { type: "divider" },
   ];
 
   for (const it of items) {
-    const section = {
+    const titleSection = {
       type: "section",
-      text: {
-        type: "mrkdwn",
-        text: `*${it.title}*`,
-      },
+      text: { type: "mrkdwn", text: `*${it.title}*` },
     };
 
-    // ✅ 商品画像（右側サムネ）
     if (it.imageUrl) {
-      section.accessory = {
+      titleSection.accessory = {
         type: "image",
         image_url: it.imageUrl,
         alt_text: it.title.slice(0, 80),
@@ -125,7 +106,10 @@ function buildBlocks(profileName, items) {
     }
 
     blocks.push(
-      /* --- Amazon / Keepa ボタン --- */
+      /* 商品名 + 画像 */
+      titleSection,
+
+      /* Amazon / Keepa ボタン（商品名の下） */
       {
         type: "actions",
         elements: [
@@ -142,10 +126,7 @@ function buildBlocks(profileName, items) {
         ],
       },
 
-      /* --- 商品名 + 画像 --- */
-      section,
-
-      /* --- 数値情報（日本語） --- */
+      /* 数値情報 */
       {
         type: "section",
         fields: [
@@ -163,7 +144,7 @@ function buildBlocks(profileName, items) {
 }
 
 /* =====================
-   プロファイル処理
+   main logic
 ===================== */
 async function runProfile(profile, remaining) {
   log(`profile START ${profile.name}`);
@@ -191,7 +172,6 @@ async function runProfile(profile, remaining) {
       if (sellers < 3) continue;
 
       picked.push({
-        asin: p.asin,
         title: p.title.replace(/\s+/g, " ").trim(),
         price: newPrice ?? null,
         sellers,
@@ -223,7 +203,7 @@ async function runProfile(profile, remaining) {
 }
 
 /* =====================
-   main
+   entry
 ===================== */
 (async () => {
   log("monitor START");
