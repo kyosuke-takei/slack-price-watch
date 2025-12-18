@@ -1,6 +1,6 @@
 // src/jobs/monitor.js
 // Keepa Finder → Product → Slack 通知
-// 画像・Keepaグラフなし / 独自レイアウト
+// ✅ 商品画像あり / ❌ Keepaグラフなし / 独自Slackレイアウト
 
 import "dotenv/config";
 import {
@@ -55,6 +55,16 @@ const chunk = (arr, size) =>
     arr.slice(i * size, i * size + size)
   );
 
+// 商品画像URL（Amazon CDN）
+function getImageUrl(product) {
+  const csv = product?.imagesCSV;
+  if (!csv) return null;
+  const id = csv.split(",")[0];
+  return id
+    ? `https://m.media-amazon.com/images/I/${id}.jpg`
+    : null;
+}
+
 /* =====================
    Finder
 ===================== */
@@ -81,7 +91,6 @@ async function fetchAsins(profile) {
     if (list.length < FINDER_PER_PAGE) break;
   }
 
-  // 後段で削られる前提なので多めに確保
   return asins.slice(0, profile.limit * 10);
 }
 
@@ -98,8 +107,25 @@ function buildBlocks(profileName, items) {
   ];
 
   for (const it of items) {
+    const section = {
+      type: "section",
+      text: {
+        type: "mrkdwn",
+        text: `*${it.title}*`,
+      },
+    };
+
+    // ✅ 商品画像（右側サムネ）
+    if (it.imageUrl) {
+      section.accessory = {
+        type: "image",
+        image_url: it.imageUrl,
+        alt_text: it.title.slice(0, 80),
+      };
+    }
+
     blocks.push(
-      /* --- ボタン（最上段） --- */
+      /* --- Amazon / Keepa ボタン --- */
       {
         type: "actions",
         elements: [
@@ -116,14 +142,8 @@ function buildBlocks(profileName, items) {
         ],
       },
 
-      /* --- 商品名 --- */
-      {
-        type: "section",
-        text: {
-          type: "mrkdwn",
-          text: `*${it.title}*`,
-        },
-      },
+      /* --- 商品名 + 画像 --- */
+      section,
 
       /* --- 数値情報（日本語） --- */
       {
@@ -167,9 +187,7 @@ async function runProfile(profile, remaining) {
       const rank = stats.current?.[3];
       const sellers = stats.totalOfferCount ?? 0;
 
-      // Amazon在庫あり除外
       if (amazonPrice && amazonPrice > 0) continue;
-      // 出品者3人未満除外
       if (sellers < 3) continue;
 
       picked.push({
@@ -181,6 +199,7 @@ async function runProfile(profile, remaining) {
         sold30: stats.salesRankDrops30 ?? null,
         amazonUrl: `https://www.amazon.co.jp/dp/${p.asin}`,
         keepaUrl: keepaProductPageUrl(p.asin),
+        imageUrl: getImageUrl(p),
       });
 
       if (picked.length >= profile.limit) break;
