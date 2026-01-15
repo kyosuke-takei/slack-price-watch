@@ -14,9 +14,6 @@ on:
 jobs:
   run-rotating-monitor:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: cloud
 
     steps:
       - uses: actions/checkout@v4
@@ -28,39 +25,38 @@ jobs:
           cache: "npm"
           cache-dependency-path: cloud/package-lock.json
 
-      - name: Install
+      - name: Install (cloud)
+        working-directory: cloud
         run: npm ci
 
-      # JST基準で「今日のジャンル」を決める：hobby -> toys -> games -> hobby -> ...
-      - name: Decide profile for today (JST)
+      - name: Decide ONLY_PROFILE for today (JST)
         shell: bash
         run: |
-          DAY=$(TZ=Asia/Tokyo date +%j)     # 001..365/366
-          IDX=$((10#$DAY % 4))             # 0..3
+          DAY=$(TZ=Asia/Tokyo date +%j)   # 001..365/366
+          IDX=$((10#$DAY % 3))           # 0..2
+          if [ "$IDX" = "0" ]; then echo "ONLY_PROFILE=hobby" >> $GITHUB_ENV; fi
+          if [ "$IDX" = "1" ]; then echo "ONLY_PROFILE=toys"  >> $GITHUB_ENV; fi
+          if [ "$IDX" = "2" ]; then echo "ONLY_PROFILE=games" >> $GITHUB_ENV; fi
 
-          PROFILE=""
-          if [ "$IDX" = "0" ]; then PROFILE="hobby"; fi
-          if [ "$IDX" = "1" ]; then PROFILE="toys";  fi
-          if [ "$IDX" = "2" ]; then PROFILE="games"; fi
-          if [ "$IDX" = "3" ]; then PROFILE="hobby"; fi
-
-          echo "PROFILE=$PROFILE" >> $GITHUB_ENV
-
-          # 1回30件（=各プロファイルlimitを30に上書き）
           echo "PROFILE_LIMIT=30" >> $GITHUB_ENV
           echo "MAX_NOTIFY=30" >> $GITHUB_ENV
 
-          echo "Today(JST day-of-year=$DAY idx=$IDX) -> PROFILE=$PROFILE"
+          echo "Today(JST day-of-year=$DAY idx=$IDX) -> ONLY_PROFILE=$ONLY_PROFILE"
 
-      - name: Run monitor (rotating)
+      - name: Run monitor (cloud)
+        working-directory: cloud
         shell: bash
         run: |
-          echo "Running ONLY_PROFILE=$PROFILE"
-          ONLY_PROFILE="$PROFILE" npm run monitor
+          echo "Running ONLY_PROFILE=$ONLY_PROFILE"
+          npm run monitor
         env:
           KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
           KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+          ONLY_PROFILE: ${{ env.ONLY_PROFILE }}
+          PROFILE_LIMIT: ${{ env.PROFILE_LIMIT }}
+          MAX_NOTIFY: ${{ env.MAX_NOTIFY }}
 
           FINDER_PER_PAGE: "100"
           FINDER_MAX_PAGES: "5"

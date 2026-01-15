@@ -1,36 +1,27 @@
 // cloud/src/jobs/monitor.js
-// Monitor ALL categories -> notify ONLY on changes
-// Change detection:
-//  - sellers decreased
-//  - price increased
-//  - rank improved (smaller is better)
-// Slack layout: 日本語 / 商品画像あり / Keepaグラフなし / ボタンは下
+// Slack Price Monitor (cloud)
+// - ONLY_PROFILE (toys/games/hobby) supported
+// - 429 Too Many Requests: wait refillIn then retry
+// - Keepa graph: none
+// - Product image: yes
+// - Buttons (Amazon/Keepa): bottom
 
 import "dotenv/config";
-import fs from "node:fs";
-import path from "node:path";
-
 import { keepaQuery, keepaProduct, keepaProductPageUrl } from "../services/keepa.js";
 import { slack } from "../services/slack.js";
 
 /* =========================
  * env
  * ========================= */
-const FINDER_PER_PAGE = numEnv("FINDER_PER_PAGE", 50);
-const FINDER_MAX_PAGES = numEnv("FINDER_MAX_PAGES", 2);
-const STATS_DAYS = numEnv("STATS_DAYS", 90);
-
+const FINDER_PER_PAGE = numEnv("FINDER_PER_PAGE", 100);
+const FINDER_MAX_PAGES = numEnv("FINDER_MAX_PAGES", 5);
 const SLACK_BATCH = clamp(numEnv("SLACK_BATCH", 1), 1, 3);
+
+const PROFILE_LIMIT = numEnv("PROFILE_LIMIT", 30);
 const MAX_NOTIFY = numEnv("MAX_NOTIFY", 30);
 
 const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5); // 5=JP
-
-// 例: ONLY_PROFILE=hobby | toys | games (なければ全カテゴリ)
 const ONLY_PROFILE = (process.env.ONLY_PROFILE || "").trim().toLowerCase();
-
-// state file
-const DATA_DIR = path.resolve(process.cwd(), "data");
-const STATE_FILE = path.join(DATA_DIR, "state.json");
 
 /* =========================
  * profiles
@@ -51,7 +42,7 @@ const DIGITAL_KEYWORDS = [
 ];
 
 /* =========================
- * utils
+ * util
  * ========================= */
 function numEnv(key, def) {
   const v = process.env[key];
@@ -85,6 +76,9 @@ function yen(v) {
   return `${Number(v).toLocaleString("ja-JP")}`;
 }
 
+/* =========================
+ * Keepa helpers
+ * ========================= */
 // Keepa stats.current: [amazon, new, used, salesRank, ...]
 function getStatsBasics(stats = {}) {
   const current = Array.isArray(stats.current) ? stats.current : [];
@@ -113,30 +107,18 @@ function getMainImageUrl(product = {}) {
   return `https://m.media-amazon.com/images/I/${firstId}.jpg`;
 }
 
-function readState() {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    if (!fs.existsSync(STATE_FILE)) return {};
-    const txt = fs.readFileSync(STATE_FILE, "utf-8");
-    const json = JSON.parse(txt);
-    if (json && typeof json === "object") return json;
-  } catch (e) {
-    log("state read error (ignored):", e?.message || e);
-  }
-  return {};
+/* =========================
+ * 429 retry wrapper
+ * ========================= */
+function extractRefillInMs(message) {
+  // "refillIn":11944
+  const m = String(message).match(/"refillIn"\s*:\s*(\d+)/);
+  if (!m) return null;
+  const ms = Number(m[1]);
+  return Number.isFinite(ms) && ms >= 0 ? ms : null;
 }
 
-function writeState(state) {
-  try {
-    if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(STATE_FILE, JSON.stringify(state, null, 2), "utf-8");
-  } catch (e) {
-    log("state write error:", e?.message || e);
-  }
-}
-
-// 429などは待って自動リトライ
-async function withRetry(fn, { label = "call", maxRetries = 5 } = {}) {
+async function withRetry(fn, { label = "call", maxRetries = 8 } = {}) {
   let attempt = 0;
   while (true) {
     try {
@@ -148,36 +130,23 @@ async function withRetry(fn, { label = "call", maxRetries = 5 } = {}) {
       const refillIn = extractRefillInMs(msg);
 
       if (refillIn != null) {
-        const waitMs = Math.min(refillIn + 250, 60_000); // 最大60秒にキャップ
-        log(`${label}: 429 detected -> wait ${waitMs}ms then retry (attempt ${attempt}/${maxRetries})`);
+        const waitMs = Math.min(refillIn + 500, 60_000);
+        log(`${label}: 429 -> wait ${waitMs}ms retry ${attempt}/${maxRetries}`);
         if (attempt > maxRetries) throw err;
         await sleep(waitMs);
         continue;
       }
 
-      // その他の一時エラーは指数バックオフ
       const backoff = Math.min(500 * Math.pow(2, attempt - 1), 10_000);
-      log(`${label}: error -> ${msg} (attempt ${attempt}/${maxRetries}) backoff=${backoff}ms`);
+      log(`${label}: error -> ${msg} (retry ${attempt}/${maxRetries}) backoff=${backoff}ms`);
       if (attempt > maxRetries) throw err;
       await sleep(backoff);
     }
   }
 }
 
-function extractRefillInMs(message) {
-  // 例: Keepa 429 Too Many Requests - {"refillIn":11944,...}
-  try {
-    const m = message.match(/"refillIn"\s*:\s*(\d+)/);
-    if (!m) return null;
-    const ms = Number(m[1]);
-    return Number.isFinite(ms) && ms >= 0 ? ms : null;
-  } catch {
-    return null;
-  }
-}
-
 /* =========================
- * Finder: get asin candidates
+ * Finder
  * ========================= */
 async function fetchAsinsForProfile(profile) {
   const asins = [];
@@ -200,7 +169,6 @@ async function fetchAsinsForProfile(profile) {
     for (const asin of list) {
       if (!asins.includes(asin)) asins.push(asin);
     }
-
     if (list.length < FINDER_PER_PAGE) break;
     page += 1;
   }
@@ -209,73 +177,21 @@ async function fetchAsinsForProfile(profile) {
 }
 
 /* =========================
- * Change detection
+ * Slack layout
  * ========================= */
-function buildCurrentSnapshot(product) {
-  const stats = product.stats || {};
-  const { amazonPrice, newPrice, salesRank } = getStatsBasics(stats);
-  const monthlySold = stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
-  const offerCount = getTotalOfferCount(stats);
-
-  const priceNow = newPrice ?? amazonPrice ?? null;
-
-  return {
-    price: priceNow,
-    sellers: offerCount,
-    rank: salesRank,
-    sold30: monthlySold,
-  };
-}
-
-function detectChange(prevSnap, currSnap) {
-  // 조건:
-  //  - sellers decreased
-  //  - price increased
-  //  - rank improved (smaller is better)
-  if (!prevSnap) return { changed: false, reasons: [] };
-
-  const reasons = [];
-
-  // sellers: 감소 감지 (null이면 비교불가)
-  if (isNum(prevSnap.sellers) && isNum(currSnap.sellers) && currSnap.sellers < prevSnap.sellers) {
-    reasons.push(`出品者 減少 ${prevSnap.sellers}→${currSnap.sellers}`);
-  }
-
-  // price: 上昇 감지
-  if (isNum(prevSnap.price) && isNum(currSnap.price) && currSnap.price > prevSnap.price) {
-    reasons.push(`価格 上昇 ${yen(prevSnap.price)}→${yen(currSnap.price)}`);
-  }
-
-  // rank: 改善 (数値が小さくなる)
-  if (isNum(prevSnap.rank) && isNum(currSnap.rank) && currSnap.rank < prevSnap.rank) {
-    reasons.push(`ランキング 上昇(改善) ${prevSnap.rank}→${currSnap.rank}`);
-  }
-
-  return { changed: reasons.length > 0, reasons };
-}
-
-function isNum(v) {
-  return typeof v === "number" && Number.isFinite(v);
-}
-
-/* =========================
- * Slack blocks
- * ========================= */
-function buildBlocks(profileName, item) {
-  // item: { title, asin, amazonUrl, keepaUrl, imageUrl, snap, reasons[] }
+function buildBlocks(profileName, it) {
   const blocks = [];
 
-  // タイトル + 画像（右）
   const titleSection = {
     type: "section",
-    text: { type: "mrkdwn", text: `*${item.title}*` },
+    text: { type: "mrkdwn", text: `*${it.title}*` },
   };
 
-  if (item.imageUrl) {
+  if (it.imageUrl) {
     titleSection.accessory = {
       type: "image",
-      image_url: item.imageUrl,
-      alt_text: (item.title || item.asin || "").slice(0, 80),
+      image_url: it.imageUrl,
+      alt_text: (it.title || it.asin || "").slice(0, 80),
     };
   }
   blocks.push(titleSection);
@@ -284,21 +200,10 @@ function buildBlocks(profileName, item) {
   blocks.push({
     type: "section",
     fields: [
-      { type: "mrkdwn", text: `*価格*\n${item.snap.price != null ? yen(item.snap.price) : "-"}` },
-      { type: "mrkdwn", text: `*出品者*\n${item.snap.sellers ?? "-"}人` },
-      { type: "mrkdwn", text: `*ランキング*\n${item.snap.rank ?? "-"}位` },
-      { type: "mrkdwn", text: `*30日販売数*\n${item.snap.sold30 ?? "-"}個` },
-    ],
-  });
-
-  // 変化理由
-  blocks.push({
-    type: "context",
-    elements: [
-      {
-        type: "mrkdwn",
-        text: `*検知:* ${item.reasons.join(" / ")}`,
-      },
+      { type: "mrkdwn", text: `*価格*\n${it.price != null ? yen(it.price) : "-"}` },
+      { type: "mrkdwn", text: `*出品者*\n${it.sellers ?? "-"}人` },
+      { type: "mrkdwn", text: `*ランキング*\n${it.rank ?? "-"}位` },
+      { type: "mrkdwn", text: `*30日販売数*\n${it.sold30 ?? "-"}個` },
     ],
   });
 
@@ -306,51 +211,36 @@ function buildBlocks(profileName, item) {
   blocks.push({
     type: "actions",
     elements: [
-      {
-        type: "button",
-        text: { type: "plain_text", text: "Amazon" },
-        url: item.amazonUrl,
-      },
-      {
-        type: "button",
-        text: { type: "plain_text", text: "Keepa" },
-        url: item.keepaUrl,
-      },
+      { type: "button", text: { type: "plain_text", text: "Amazon" }, url: it.amazonUrl },
+      { type: "button", text: { type: "plain_text", text: "Keepa" }, url: it.keepaUrl },
     ],
   });
 
-  // フッタ
   blocks.push({
     type: "context",
-    elements: [{ type: "mrkdwn", text: `カテゴリ: *${profileName}*  / ASIN: \`${item.asin}\`` }],
+    elements: [{ type: "mrkdwn", text: `カテゴリ: *${profileName}* / ASIN: \`${it.asin}\`` }],
   });
 
   blocks.push({ type: "divider" });
-
   return blocks;
 }
 
 async function postToSlack(profileName, items) {
   if (!items.length) return 0;
 
-  // Slackはデカいblocks嫌うので「1通知=1商品」を基本にする
-  // ただし SLACK_BATCH > 1 の場合はまとめて投げる（失敗したら分割フォールバック）
   const groups = chunk(items, SLACK_BATCH);
   let sent = 0;
 
   for (const group of groups) {
     const blocks = [];
     for (const it of group) blocks.push(...buildBlocks(profileName, it));
-
     const fallback = `${profileName}: ${group[0].title?.slice(0, 60) || group[0].asin} ほか${group.length}件`;
 
     try {
       await slack({ text: fallback, blocks });
       sent += group.length;
     } catch (e) {
-      log(`Slack group post failed (${profileName}, size=${group.length}) -> fallback single`, e?.message || e);
-
-      // 1件ずつ
+      log(`Slack group failed (${profileName}, size=${group.length}) -> single`, e?.message || e);
       for (const it of group) {
         try {
           await slack({
@@ -369,35 +259,32 @@ async function postToSlack(profileName, items) {
 }
 
 /* =========================
- * Main per profile
+ * main per profile
  * ========================= */
-async function processProfile(profile, state, remainingNotify) {
+async function processProfile(profile, remainingNotify) {
   log(`profile START ${profile.name}`);
 
   const asins = await fetchAsinsForProfile(profile);
   if (!asins.length) {
     log(`profile DONE ${profile.name} (no asins)`);
-    return { notified: 0, nextState: state };
+    return 0;
   }
 
-  // Product APIはまとめて20ずつ
   const asinChunks = chunk(asins, 20);
-
-  const notifyItems = [];
-  const nextState = { ...state }; // shallow copy
+  const picked = [];
 
   for (const ch of asinChunks) {
-    if (notifyItems.length >= remainingNotify) break;
+    if (picked.length >= remainingNotify) break;
 
     let res;
     try {
-      res = await withRetry(() => keepaProduct(ch, { statsDays: STATS_DAYS }), {
+      res = await withRetry(() => keepaProduct(ch, { statsDays: 90 }), {
         label: `keepaProduct:${profile.key}`,
-        maxRetries: 8,
+        maxRetries: 10,
       });
     } catch (e) {
-      // ここで落とさない（カテゴリ継続）
-      log(`keepaProduct fatal for ${profile.name} (continue)`, e?.message || e);
+      // ここで落とさずカテゴリ継続
+      log(`keepaProduct failed for ${profile.name} (continue)`, e?.message || e);
       continue;
     }
 
@@ -406,90 +293,67 @@ async function processProfile(profile, state, remainingNotify) {
     for (const p of products) {
       if (!p?.asin) continue;
 
-      // ゲーム: DL版除外
       if (profile.excludeDigital && isDigitalTitle(p.title)) continue;
 
-      const snap = buildCurrentSnapshot(p);
+      const stats = p.stats || {};
+      const { amazonPrice, newPrice, salesRank } = getStatsBasics(stats);
 
-      // Amazon在庫があるのは除外（amazonPrice>0 の場合、priceに入る可能性があるので別で判定）
-      const basics = getStatsBasics(p.stats || {});
-      if (basics.amazonPrice && basics.amazonPrice > 0) continue;
+      // Amazon在庫があるものは除外
+      if (amazonPrice && amazonPrice > 0) continue;
 
-      // 出品者が3未満は除外（prev比較対象にもならないのでノイズ防止）
-      if (snap.sellers == null || snap.sellers < 3) {
-        // ただ state は更新しておく（次回の基準）
-        nextState[p.asin] = { ...(nextState[p.asin] || {}), ...snap };
-        continue;
-      }
+      const sellers = getTotalOfferCount(stats);
+      if (sellers == null || sellers < 3) continue;
 
-      const prev = state[p.asin];
-      const { changed, reasons } = detectChange(prev, snap);
+      const monthlySold = stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
+      const price = newPrice ?? amazonPrice ?? null;
 
-      // state更新（常に最新にする）
-      nextState[p.asin] = { ...(nextState[p.asin] || {}), ...snap };
-
-      if (!changed) continue;
-
-      const title = normalizeTitle(p.title);
-      const amazonUrl = `https://www.amazon.co.jp/dp/${p.asin}`;
-      const keepaUrl = keepaProductPageUrl(p.asin);
-      const imageUrl = getMainImageUrl(p);
-
-      notifyItems.push({
+      const it = {
         asin: p.asin,
-        title,
-        amazonUrl,
-        keepaUrl,
-        imageUrl,
-        snap,
-        reasons,
-      });
+        title: normalizeTitle(p.title),
+        price,
+        sellers,
+        rank: salesRank,
+        sold30: monthlySold,
+        amazonUrl: `https://www.amazon.co.jp/dp/${p.asin}`,
+        keepaUrl: keepaProductPageUrl(p.asin),
+        imageUrl: getMainImageUrl(p),
+      };
 
-      if (notifyItems.length >= remainingNotify) break;
+      picked.push(it);
+      if (picked.length >= PROFILE_LIMIT || picked.length >= remainingNotify) break;
     }
   }
 
-  // 通知
-  let sent = 0;
-  if (notifyItems.length) {
-    sent = await postToSlack(profile.name, notifyItems);
+  if (!picked.length) {
+    log(`profile DONE ${profile.name} (no items after filters)`);
+    return 0;
   }
 
+  const sent = await postToSlack(profile.name, picked);
   log(`profile DONE ${profile.name} notified=${sent}`);
-
-  return { notified: sent, nextState };
+  return sent;
 }
 
 /* =========================
- * Main
+ * main
  * ========================= */
 async function main() {
   log(`monitor START (ONLY_PROFILE=${ONLY_PROFILE || "all"})`);
 
-  const state = readState();
-
-  // 対象プロファイル決定
   let targets = PROFILES;
   if (ONLY_PROFILE) {
-    targets = PROFILES.filter((p) => p.key === ONLY_PROFILE);
-    if (!targets.length) {
-      log(`Unknown ONLY_PROFILE=${ONLY_PROFILE} -> fallback all`);
-      targets = PROFILES;
-    }
+    const filtered = PROFILES.filter((p) => p.key === ONLY_PROFILE);
+    if (filtered.length) targets = filtered;
+    else log(`Unknown ONLY_PROFILE=${ONLY_PROFILE} -> fallback all`);
   }
 
   let remaining = MAX_NOTIFY;
-  let nextState = state;
 
   for (const profile of targets) {
     if (remaining <= 0) break;
-
-    const result = await processProfile(profile, nextState, remaining);
-    remaining -= result.notified;
-    nextState = result.nextState;
+    const used = await processProfile(profile, remaining);
+    remaining -= used;
   }
-
-  writeState(nextState);
 
   log("monitor DONE");
 }
