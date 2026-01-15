@@ -1,12 +1,17 @@
 // cloud/src/jobs/monitor.js
-// Slack Price Monitor (cloud)
+// Slack Price Monitor (cloud) - with state (diff-only notify)
 // - ONLY_PROFILE (toys/games/hobby) supported
 // - 429 Too Many Requests: wait refillIn then retry
-// - Keepa graph: none
 // - Product image: yes
 // - Buttons (Amazon/Keepa): bottom
+// - Diff-only notify by comparing with previous state (price/sellers/rank/sold30)
+// - Anti-spam: cooldown hours per ASIN
 
 import "dotenv/config";
+import fs from "node:fs";
+import path from "node:path";
+import { fileURLToPath } from "node:url";
+
 import { keepaQuery, keepaProduct, keepaProductPageUrl } from "../services/keepa.js";
 import { slack } from "../services/slack.js";
 
@@ -22,6 +27,16 @@ const MAX_NOTIFY = numEnv("MAX_NOTIFY", 30);
 
 const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5); // 5=JP
 const ONLY_PROFILE = (process.env.ONLY_PROFILE || "").trim().toLowerCase();
+
+// diff / state
+const STATE_FILE = process.env.STATE_FILE || "cloud/data/state.json";
+
+// threshold / cooldown
+const PRICE_DELTA_YEN = numEnv("PRICE_DELTA_YEN", 200); // price change >= 200 yen triggers notify
+const RANK_DELTA_ABS = numEnv("RANK_DELTA_ABS", 5000); // rank change >= 5000 triggers notify
+const SELLERS_DELTA_ABS = numEnv("SELLERS_DELTA_ABS", 1); // sellers change >= 1 triggers notify
+const SOLD30_DELTA_ABS = numEnv("SOLD30_DELTA_ABS", 5); // sold30 change >= 5 triggers notify
+const NOTIFY_COOLDOWN_HOURS = numEnv("NOTIFY_COOLDOWN_HOURS", 6); // same asin won't re-notify within N hours
 
 /* =========================
  * profiles
@@ -53,8 +68,10 @@ function clamp(v, min, max) {
   if (!Number.isFinite(v)) return min;
   return Math.max(min, Math.min(max, v));
 }
+// NOTE: GitHub Actionsのマスク暴発を避けるため ISO日時ではなくUNIX秒を使う
 function log(...args) {
-  console.log(new Date().toISOString(), ...args);
+  const ts = Math.floor(Date.now() / 1000);
+  console.log(`[${ts}]`, ...args);
 }
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -74,6 +91,53 @@ function chunk(array, size) {
 function yen(v) {
   if (v == null) return "-";
   return `${Number(v).toLocaleString("ja-JP")}`;
+}
+function nowSec() {
+  return Math.floor(Date.now() / 1000);
+}
+function absDelta(a, b) {
+  if (a == null || b == null) return null;
+  const da = Number(a);
+  const db = Number(b);
+  if (!Number.isFinite(da) || !Number.isFinite(db)) return null;
+  return Math.abs(da - db);
+}
+function ensureDirForFile(filepath) {
+  const dir = path.dirname(filepath);
+  fs.mkdirSync(dir, { recursive: true });
+}
+
+/* =========================
+ * state (read/write)
+ * ========================= */
+function loadState() {
+  try {
+    if (!fs.existsSync(STATE_FILE)) {
+      return { version: 1, updatedAt: nowSec(), asins: {} };
+    }
+    const raw = fs.readFileSync(STATE_FILE, "utf8");
+    const obj = JSON.parse(raw);
+    if (!obj || typeof obj !== "object") throw new Error("state invalid object");
+    if (!obj.asins || typeof obj.asins !== "object") obj.asins = {};
+    if (!obj.version) obj.version = 1;
+    return obj;
+  } catch (e) {
+    log("state load failed -> start fresh", e?.message || e);
+    return { version: 1, updatedAt: nowSec(), asins: {} };
+  }
+}
+
+function saveState(state) {
+  try {
+    ensureDirForFile(STATE_FILE);
+    state.updatedAt = nowSec();
+    const tmp = `${STATE_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), "utf8");
+    fs.renameSync(tmp, STATE_FILE);
+    log("state saved", { file: STATE_FILE, asinCount: Object.keys(state.asins || {}).length });
+  } catch (e) {
+    log("state save failed", e?.message || e);
+  }
 }
 
 /* =========================
@@ -177,6 +241,36 @@ async function fetchAsinsForProfile(profile) {
 }
 
 /* =========================
+ * diff logic
+ * ========================= */
+function shouldNotifyByDiff(prev, cur) {
+  // first time -> notify (but still subject to cooldown if prev exists)
+  if (!prev) return { ok: true, reasons: ["new"] };
+
+  const reasons = [];
+
+  const pd = absDelta(prev.price, cur.price);
+  if (pd != null && pd >= PRICE_DELTA_YEN) reasons.push(`priceΔ${pd}`);
+
+  const sd = absDelta(prev.sellers, cur.sellers);
+  if (sd != null && sd >= SELLERS_DELTA_ABS) reasons.push(`sellersΔ${sd}`);
+
+  const rd = absDelta(prev.rank, cur.rank);
+  if (rd != null && rd >= RANK_DELTA_ABS) reasons.push(`rankΔ${rd}`);
+
+  const dd = absDelta(prev.sold30, cur.sold30);
+  if (dd != null && dd >= SOLD30_DELTA_ABS) reasons.push(`sold30Δ${dd}`);
+
+  return { ok: reasons.length > 0, reasons };
+}
+
+function isInCooldown(prev) {
+  if (!prev?.lastNotifiedAt) return false;
+  const cooldownSec = NOTIFY_COOLDOWN_HOURS * 3600;
+  return nowSec() - prev.lastNotifiedAt < cooldownSec;
+}
+
+/* =========================
  * Slack layout
  * ========================= */
 function buildBlocks(profileName, it) {
@@ -206,6 +300,14 @@ function buildBlocks(profileName, it) {
       { type: "mrkdwn", text: `*30日販売数*\n${it.sold30 ?? "-"}個` },
     ],
   });
+
+  // 変更理由
+  if (it.diffReasons?.length) {
+    blocks.push({
+      type: "context",
+      elements: [{ type: "mrkdwn", text: `変更検知: ${it.diffReasons.map((x) => `\`${x}\``).join(" ")}` }],
+    });
+  }
 
   // ボタン（下）
   blocks.push({
@@ -261,7 +363,7 @@ async function postToSlack(profileName, items) {
 /* =========================
  * main per profile
  * ========================= */
-async function processProfile(profile, remainingNotify) {
+async function processProfile(profile, remainingNotify, state) {
   log(`profile START ${profile.name}`);
 
   const asins = await fetchAsinsForProfile(profile);
@@ -272,6 +374,10 @@ async function processProfile(profile, remainingNotify) {
 
   const asinChunks = chunk(asins, 20);
   const picked = [];
+
+  let scanned = 0;
+  let skippedCooldown = 0;
+  let skippedNoDiff = 0;
 
   for (const ch of asinChunks) {
     if (picked.length >= remainingNotify) break;
@@ -291,6 +397,7 @@ async function processProfile(profile, remainingNotify) {
     const products = Array.isArray(res?.products) ? res.products : [];
 
     for (const p of products) {
+      scanned += 1;
       if (!p?.asin) continue;
 
       if (profile.excludeDigital && isDigitalTitle(p.title)) continue;
@@ -307,7 +414,7 @@ async function processProfile(profile, remainingNotify) {
       const monthlySold = stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
       const price = newPrice ?? amazonPrice ?? null;
 
-      const it = {
+      const cur = {
         asin: p.asin,
         title: normalizeTitle(p.title),
         price,
@@ -319,19 +426,65 @@ async function processProfile(profile, remainingNotify) {
         imageUrl: getMainImageUrl(p),
       };
 
-      picked.push(it);
+      const prev = state.asins?.[cur.asin];
+
+      // cooldown
+      if (prev && isInCooldown(prev)) {
+        skippedCooldown += 1;
+        // stateは更新だけしておく（値は追従）
+        state.asins[cur.asin] = { ...prev, ...pickStateFields(cur), lastSeenAt: nowSec() };
+        continue;
+      }
+
+      // diff
+      const diff = shouldNotifyByDiff(prev, cur);
+      if (!diff.ok) {
+        skippedNoDiff += 1;
+        // 通知しないが state は更新
+        state.asins[cur.asin] = { ...(prev || {}), ...pickStateFields(cur), lastSeenAt: nowSec() };
+        continue;
+      }
+
+      // notify item
+      picked.push({ ...cur, diffReasons: diff.reasons });
+
+      // stateを通知済みに更新
+      state.asins[cur.asin] = {
+        ...(prev || {}),
+        ...pickStateFields(cur),
+        lastNotifiedAt: nowSec(),
+        lastSeenAt: nowSec(),
+      };
+
       if (picked.length >= PROFILE_LIMIT || picked.length >= remainingNotify) break;
     }
   }
 
   if (!picked.length) {
-    log(`profile DONE ${profile.name} (no items after filters)`);
+    log(
+      `profile DONE ${profile.name} (no diff items) scanned=${scanned} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
+    );
     return 0;
   }
 
   const sent = await postToSlack(profile.name, picked);
-  log(`profile DONE ${profile.name} notified=${sent}`);
+  log(
+    `profile DONE ${profile.name} notified=${sent} picked=${picked.length} scanned=${scanned} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
+  );
   return sent;
+}
+
+function pickStateFields(cur) {
+  return {
+    title: cur.title,
+    price: cur.price ?? null,
+    sellers: cur.sellers ?? null,
+    rank: cur.rank ?? null,
+    sold30: cur.sold30 ?? null,
+    amazonUrl: cur.amazonUrl,
+    keepaUrl: cur.keepaUrl,
+    imageUrl: cur.imageUrl ?? null,
+  };
 }
 
 /* =========================
@@ -339,6 +492,10 @@ async function processProfile(profile, remainingNotify) {
  * ========================= */
 async function main() {
   log(`monitor START (ONLY_PROFILE=${ONLY_PROFILE || "all"})`);
+
+  // load state
+  const state = loadState();
+  if (!state.asins) state.asins = {};
 
   let targets = PROFILES;
   if (ONLY_PROFILE) {
@@ -348,14 +505,19 @@ async function main() {
   }
 
   let remaining = MAX_NOTIFY;
+  let totalNotified = 0;
 
   for (const profile of targets) {
     if (remaining <= 0) break;
-    const used = await processProfile(profile, remaining);
+    const used = await processProfile(profile, remaining, state);
     remaining -= used;
+    totalNotified += used;
   }
 
-  log("monitor DONE");
+  // save state at end
+  saveState(state);
+
+  log(`monitor DONE notified=${totalNotified}`);
 }
 
 main().catch((err) => {

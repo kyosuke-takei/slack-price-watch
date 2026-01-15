@@ -1,65 +1,76 @@
-name: Slack Price Monitor (rotating)
+name: slack-price-watch
 
 on:
   schedule:
-    # GitHub Actions cron is UTC. JST = UTC+9
-    # 09:00 JST -> 00:00 UTC
-    # 15:00 JST -> 06:00 UTC
-    # 20:00 JST -> 11:00 UTC
-    - cron: "0 0 * * *"
-    - cron: "0 6 * * *"
-    - cron: "0 11 * * *"
+    - cron: "0 */3 * * *" # UTC。JSTにしたい場合は調整
   workflow_dispatch:
 
 jobs:
-  run-rotating-monitor:
+  monitor:
     runs-on: ubuntu-latest
 
+    env:
+      ONLY_PROFILE: hobby
+      PROFILE_LIMIT: 30
+      MAX_NOTIFY: 30
+
+      FINDER_PER_PAGE: 100
+      FINDER_MAX_PAGES: 5
+      SLACK_BATCH: 3
+
+      STRICT_FINDER: on
+      STRICT_CATEGORY_MATCH: on
+
+      # diff tuning
+      PRICE_DELTA_YEN: 200
+      RANK_DELTA_ABS: 5000
+      SELLERS_DELTA_ABS: 1
+      SOLD30_DELTA_ABS: 5
+      NOTIFY_COOLDOWN_HOURS: 6
+
+      # state file path (repo root 기준)
+      STATE_FILE: cloud/data/state.json
+
+      # secrets
+      KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
+      KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
+      SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          node-version: "22"
-          cache: "npm"
-          cache-dependency-path: cloud/package-lock.json
+          node-version: 22
 
-      - name: Install (cloud)
-        working-directory: cloud
+      - name: Install deps
         run: npm ci
-
-      - name: Decide ONLY_PROFILE for today (JST)
-        shell: bash
-        run: |
-          DAY=$(TZ=Asia/Tokyo date +%j)   # 001..365/366
-          IDX=$((10#$DAY % 3))           # 0..2
-          if [ "$IDX" = "0" ]; then echo "ONLY_PROFILE=hobby" >> $GITHUB_ENV; fi
-          if [ "$IDX" = "1" ]; then echo "ONLY_PROFILE=toys"  >> $GITHUB_ENV; fi
-          if [ "$IDX" = "2" ]; then echo "ONLY_PROFILE=games" >> $GITHUB_ENV; fi
-
-          echo "PROFILE_LIMIT=30" >> $GITHUB_ENV
-          echo "MAX_NOTIFY=30" >> $GITHUB_ENV
-
-          echo "Today(JST day-of-year=$DAY idx=$IDX) -> ONLY_PROFILE=$ONLY_PROFILE"
-
-      - name: Run monitor (cloud)
         working-directory: cloud
-        shell: bash
+
+      # --- Restore cached state.json (if exists) ---
+      - name: Restore state cache
+        uses: actions/cache/restore@v4
+        with:
+          path: cloud/data/state.json
+          key: state-${{ env.ONLY_PROFILE }}-${{ github.run_id }}
+          restore-keys: |
+            state-${{ env.ONLY_PROFILE }}-
+
+      - name: Show state existence
         run: |
-          echo "Running ONLY_PROFILE=$ONLY_PROFILE"
-          npm run monitor
-        env:
-          KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
-          KEEPA_DOMAIN: ${{ secrets.KEEPA_DOMAIN }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          echo "ONLY_PROFILE=$ONLY_PROFILE"
+          ls -la cloud/data || true
+          if [ -f cloud/data/state.json ]; then echo "state.json exists"; else echo "state.json missing"; fi
 
-          ONLY_PROFILE: ${{ env.ONLY_PROFILE }}
-          PROFILE_LIMIT: ${{ env.PROFILE_LIMIT }}
-          MAX_NOTIFY: ${{ env.MAX_NOTIFY }}
+      - name: Run monitor
+        run: npm run monitor
+        working-directory: cloud
 
-          FINDER_PER_PAGE: "100"
-          FINDER_MAX_PAGES: "5"
-          SLACK_BATCH: "3"
-          STRICT_FINDER: "on"
-          STRICT_CATEGORY_MATCH: "on"
+      # --- Save state.json to cache for next run ---
+      - name: Save state cache
+        uses: actions/cache/save@v4
+        with:
+          path: cloud/data/state.json
+          key: state-${{ env.ONLY_PROFILE }}-${{ github.run_id }}
