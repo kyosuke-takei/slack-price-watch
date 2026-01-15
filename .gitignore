@@ -1,3 +1,6 @@
 node_modules/
 .env
 logs/
+# runtime state (do not commit)
+cloud/data/state.json
+cloud/data/*.json
