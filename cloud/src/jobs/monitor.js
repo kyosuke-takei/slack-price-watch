@@ -1,5 +1,8 @@
 // cloud/src/jobs/monitor.js
-// 商品画像あり / Keepaグラフなし / ボタンは商品名の下
+// Slack Price Monitor (cloud)
+// - ONLY_PROFILE 対応（toys / games / hobby）
+// - 商品画像あり / Keepaグラフなし
+// - ボタンは商品名の下
 
 import "dotenv/config";
 import {
@@ -14,20 +17,45 @@ import { slack } from "../services/slack.js";
 ===================== */
 const FINDER_PER_PAGE = Number(process.env.FINDER_PER_PAGE || 100);
 const FINDER_MAX_PAGES = Number(process.env.FINDER_MAX_PAGES || 5);
-const SLACK_BATCH = Math.min(Math.max(Number(process.env.SLACK_BATCH || 3), 1), 3);
+const SLACK_BATCH = Math.min(
+  Math.max(Number(process.env.SLACK_BATCH || 3), 1),
+  3
+);
 const MAX_NOTIFY = Number(process.env.MAX_NOTIFY || 30);
 const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5);
+
+const ONLY_PROFILE = (process.env.ONLY_PROFILE || "").toLowerCase().trim();
 
 /* =====================
    profiles
 ===================== */
 const PROFILES = [
-  { name: "おもちゃ", rootCategory: 13299531, limit: 30, excludeDigital: false },
-  { name: "ゲーム", rootCategory: 637394, limit: 30, excludeDigital: true },
-  { name: "ホビー", rootCategory: 2277721051, limit: 30, excludeDigital: false },
+  {
+    key: "toys",
+    name: "おもちゃ",
+    rootCategory: 13299531,
+    limit: 30,
+    excludeDigital: false,
+  },
+  {
+    key: "games",
+    name: "ゲーム",
+    rootCategory: 637394,
+    limit: 30,
+    excludeDigital: true,
+  },
+  {
+    key: "hobby",
+    name: "ホビー",
+    rootCategory: 2277721051,
+    limit: 30,
+    excludeDigital: false,
+  },
 ];
 
-const DIGITAL_KEYWORDS = ["ダウンロード", "オンラインコード", "download", "digital"];
+const ACTIVE_PROFILES = ONLY_PROFILE
+  ? PROFILES.filter((p) => p.key === ONLY_PROFILE)
+  : PROFILES;
 
 /* =====================
    utils
@@ -39,13 +67,24 @@ const yen = (v) =>
     ? `¥${Number(v).toLocaleString("ja-JP")}`
     : "-";
 
+const DIGITAL_KEYWORDS = [
+  "ダウンロード",
+  "オンラインコード",
+  "download",
+  "digital",
+];
+
 const isDigitalTitle = (t = "") =>
-  DIGITAL_KEYWORDS.some((k) => t.toLowerCase().includes(k.toLowerCase()));
+  DIGITAL_KEYWORDS.some((k) => t.toLowerCase().includes(k));
 
 const chunk = (arr, size) =>
   Array.from({ length: Math.ceil(arr.length / size) }, (_, i) =>
     arr.slice(i * size, i * size + size)
   );
+
+function normalizeTitle(t = "") {
+  return t.replace(/\s+/g, " ").trim();
+}
 
 function getImageUrl(p) {
   const csv = p?.imagesCSV;
@@ -76,6 +115,7 @@ async function fetchAsins(profile) {
     for (const asin of list) {
       if (!asins.includes(asin)) asins.push(asin);
     }
+
     if (list.length < FINDER_PER_PAGE) break;
   }
 
@@ -87,14 +127,20 @@ async function fetchAsins(profile) {
 ===================== */
 function buildBlocks(profileName, items) {
   const blocks = [
-    { type: "header", text: { type: "plain_text", text: profileName } },
+    {
+      type: "header",
+      text: { type: "plain_text", text: profileName },
+    },
     { type: "divider" },
   ];
 
   for (const it of items) {
     const titleSection = {
       type: "section",
-      text: { type: "mrkdwn", text: `*${it.title}*` },
+      text: {
+        type: "mrkdwn",
+        text: `*${it.title}*`,
+      },
     };
 
     if (it.imageUrl) {
@@ -106,10 +152,10 @@ function buildBlocks(profileName, items) {
     }
 
     blocks.push(
-      /* 商品名 + 画像 */
+      // 商品名 + 画像
       titleSection,
 
-      /* Amazon / Keepa ボタン（商品名の下） */
+      // Amazon / Keepa ボタン（商品名の下）
       {
         type: "actions",
         elements: [
@@ -126,14 +172,17 @@ function buildBlocks(profileName, items) {
         ],
       },
 
-      /* 数値情報 */
+      // 数値情報（日本語）
       {
         type: "section",
         fields: [
           { type: "mrkdwn", text: `*価格*\n${yen(it.price)}` },
           { type: "mrkdwn", text: `*出品者*\n${it.sellers ?? "-"}人` },
           { type: "mrkdwn", text: `*ランキング*\n${it.rank ?? "-"}位` },
-          { type: "mrkdwn", text: `*30日販売数*\n${it.sold30 ?? "-"}個` },
+          {
+            type: "mrkdwn",
+            text: `*30日販売数*\n${it.sold30 ?? "-"}個`,
+          },
         ],
       },
       { type: "divider" }
@@ -168,11 +217,13 @@ async function runProfile(profile, remaining) {
       const rank = stats.current?.[3];
       const sellers = stats.totalOfferCount ?? 0;
 
+      // Amazon在庫ありは除外
       if (amazonPrice && amazonPrice > 0) continue;
+      // 出品者3人未満は除外
       if (sellers < 3) continue;
 
       picked.push({
-        title: p.title.replace(/\s+/g, " ").trim(),
+        title: normalizeTitle(p.title),
         price: newPrice ?? null,
         sellers,
         rank,
@@ -206,13 +257,17 @@ async function runProfile(profile, remaining) {
    entry
 ===================== */
 (async () => {
-  log("monitor START");
+  log(`monitor START (ONLY_PROFILE=${ONLY_PROFILE || "all"})`);
 
   let remaining = MAX_NOTIFY;
-  for (const profile of PROFILES) {
+
+  for (const profile of ACTIVE_PROFILES) {
     if (remaining <= 0) break;
     remaining -= await runProfile(profile, remaining);
   }
 
   log("monitor DONE");
-})();
+})().catch((err) => {
+  console.error("monitor FATAL", err);
+  process.exitCode = 1;
+});
