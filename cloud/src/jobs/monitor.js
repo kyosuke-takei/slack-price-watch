@@ -1,16 +1,14 @@
 // cloud/src/jobs/monitor.js
-// Slack Price Monitor (cloud) - with state (diff-only notify)
-// - ONLY_PROFILE (toys/games/hobby) supported
-// - 429 Too Many Requests: wait refillIn then retry
-// - Product image: yes
-// - Buttons (Amazon/Keepa): bottom
-// - Diff-only notify by comparing with previous state (price/sellers/rank/sold30)
-// - Anti-spam: cooldown hours per ASIN
+// Slack Price Monitor (cloud)
+// - state.json で前回比較して差分があった商品のみ通知
+// - 2000円未満は除外（stateにも保存しない）
+// - state自動掃除（lastSeenAt が N日より古いASINを削除）
+// - Slack表示に ▲▼ と増減（価格/出品者/ランキング/販売数）
+//   ※ランキングは「小さいほど良い」ため、数値が小さくなったら改善（▼）として表示
 
 import "dotenv/config";
 import fs from "node:fs";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import { keepaQuery, keepaProduct, keepaProductPageUrl } from "../services/keepa.js";
 import { slack } from "../services/slack.js";
@@ -28,15 +26,20 @@ const MAX_NOTIFY = numEnv("MAX_NOTIFY", 30);
 const DOMAIN = Number(process.env.KEEPA_DOMAIN || 5); // 5=JP
 const ONLY_PROFILE = (process.env.ONLY_PROFILE || "").trim().toLowerCase();
 
-// diff / state
 const STATE_FILE = process.env.STATE_FILE || "cloud/data/state.json";
 
-// threshold / cooldown
-const PRICE_DELTA_YEN = numEnv("PRICE_DELTA_YEN", 200); // price change >= 200 yen triggers notify
-const RANK_DELTA_ABS = numEnv("RANK_DELTA_ABS", 5000); // rank change >= 5000 triggers notify
-const SELLERS_DELTA_ABS = numEnv("SELLERS_DELTA_ABS", 1); // sellers change >= 1 triggers notify
-const SOLD30_DELTA_ABS = numEnv("SOLD30_DELTA_ABS", 5); // sold30 change >= 5 triggers notify
-const NOTIFY_COOLDOWN_HOURS = numEnv("NOTIFY_COOLDOWN_HOURS", 6); // same asin won't re-notify within N hours
+// filter
+const MIN_PRICE_YEN = numEnv("MIN_PRICE_YEN", 2000);
+
+// diff / cooldown
+const PRICE_DELTA_YEN = numEnv("PRICE_DELTA_YEN", 200);
+const RANK_DELTA_ABS = numEnv("RANK_DELTA_ABS", 5000);
+const SELLERS_DELTA_ABS = numEnv("SELLERS_DELTA_ABS", 1);
+const SOLD30_DELTA_ABS = numEnv("SOLD30_DELTA_ABS", 5);
+const NOTIFY_COOLDOWN_HOURS = numEnv("NOTIFY_COOLDOWN_HOURS", 6);
+
+// state cleanup
+const STATE_TTL_DAYS = numEnv("STATE_TTL_DAYS", 30);
 
 /* =========================
  * profiles
@@ -68,7 +71,6 @@ function clamp(v, min, max) {
   if (!Number.isFinite(v)) return min;
   return Math.max(min, Math.min(max, v));
 }
-// NOTE: GitHub Actionsのマスク暴発を避けるため ISO日時ではなくUNIX秒を使う
 function log(...args) {
   const ts = Math.floor(Date.now() / 1000);
   console.log(`[${ts}]`, ...args);
@@ -106,9 +108,18 @@ function ensureDirForFile(filepath) {
   const dir = path.dirname(filepath);
   fs.mkdirSync(dir, { recursive: true });
 }
+function signDelta(n) {
+  if (n == null || !Number.isFinite(Number(n)) || Number(n) === 0) return "";
+  const v = Number(n);
+  return v > 0 ? `+${v}` : `${v}`;
+}
+function arrowForDelta(n) {
+  if (n == null || !Number.isFinite(Number(n)) || Number(n) === 0) return "";
+  return Number(n) > 0 ? "▲" : "▼";
+}
 
 /* =========================
- * state (read/write)
+ * state (read/write/cleanup)
  * ========================= */
 function loadState() {
   try {
@@ -140,10 +151,31 @@ function saveState(state) {
   }
 }
 
+function cleanupState(state) {
+  const ttlSec = STATE_TTL_DAYS * 86400;
+  const cutoff = nowSec() - ttlSec;
+
+  const asins = state.asins || {};
+  let removed = 0;
+
+  for (const [asin, v] of Object.entries(asins)) {
+    const lastSeenAt = v?.lastSeenAt;
+    if (typeof lastSeenAt === "number" && lastSeenAt > 0) {
+      if (lastSeenAt < cutoff) {
+        delete asins[asin];
+        removed += 1;
+      }
+    }
+  }
+
+  state.asins = asins;
+  if (removed > 0) log(`state cleanup removed=${removed} ttlDays=${STATE_TTL_DAYS}`);
+  return removed;
+}
+
 /* =========================
  * Keepa helpers
  * ========================= */
-// Keepa stats.current: [amazon, new, used, salesRank, ...]
 function getStatsBasics(stats = {}) {
   const current = Array.isArray(stats.current) ? stats.current : [];
   const amazonRaw = current[0];
@@ -175,7 +207,6 @@ function getMainImageUrl(product = {}) {
  * 429 retry wrapper
  * ========================= */
 function extractRefillInMs(message) {
-  // "refillIn":11944
   const m = String(message).match(/"refillIn"\s*:\s*(\d+)/);
   if (!m) return null;
   const ms = Number(m[1]);
@@ -244,7 +275,6 @@ async function fetchAsinsForProfile(profile) {
  * diff logic
  * ========================= */
 function shouldNotifyByDiff(prev, cur) {
-  // first time -> notify (but still subject to cooldown if prev exists)
   if (!prev) return { ok: true, reasons: ["new"] };
 
   const reasons = [];
@@ -271,8 +301,22 @@ function isInCooldown(prev) {
 }
 
 /* =========================
- * Slack layout
+ * Slack layout helpers
  * ========================= */
+function formatWithDelta(current, prevValue, formatter) {
+  if (current == null) return "-";
+  const curStr = formatter(current);
+
+  if (prevValue == null) return curStr;
+
+  const delta = Number(current) - Number(prevValue);
+  if (!Number.isFinite(delta) || delta === 0) return curStr;
+
+  const arrow = arrowForDelta(delta);
+  const dStr = signDelta(delta);
+  return `${curStr} (${arrow}${dStr})`;
+}
+
 function buildBlocks(profileName, it) {
   const blocks = [];
 
@@ -290,18 +334,28 @@ function buildBlocks(profileName, it) {
   }
   blocks.push(titleSection);
 
-  // 数値情報（日本語）
   blocks.push({
     type: "section",
     fields: [
-      { type: "mrkdwn", text: `*価格*\n${it.price != null ? yen(it.price) : "-"}` },
-      { type: "mrkdwn", text: `*出品者*\n${it.sellers ?? "-"}人` },
-      { type: "mrkdwn", text: `*ランキング*\n${it.rank ?? "-"}位` },
-      { type: "mrkdwn", text: `*30日販売数*\n${it.sold30 ?? "-"}個` },
+      {
+        type: "mrkdwn",
+        text: `*価格*\n${formatWithDelta(it.price, it.prev?.price ?? null, (v) => `${yen(v)}円`)}`,
+      },
+      {
+        type: "mrkdwn",
+        text: `*出品者*\n${formatWithDelta(it.sellers, it.prev?.sellers ?? null, (v) => `${v}人`)}`,
+      },
+      {
+        type: "mrkdwn",
+        text: `*ランキング*\n${formatWithDelta(it.rank, it.prev?.rank ?? null, (v) => `${Number(v).toLocaleString("ja-JP")}位`)}`,
+      },
+      {
+        type: "mrkdwn",
+        text: `*30日販売数*\n${formatWithDelta(it.sold30, it.prev?.sold30 ?? null, (v) => `${v}個`)}`,
+      },
     ],
   });
 
-  // 変更理由
   if (it.diffReasons?.length) {
     blocks.push({
       type: "context",
@@ -309,7 +363,6 @@ function buildBlocks(profileName, it) {
     });
   }
 
-  // ボタン（下）
   blocks.push({
     type: "actions",
     elements: [
@@ -378,6 +431,7 @@ async function processProfile(profile, remainingNotify, state) {
   let scanned = 0;
   let skippedCooldown = 0;
   let skippedNoDiff = 0;
+  let skippedMinPrice = 0;
 
   for (const ch of asinChunks) {
     if (picked.length >= remainingNotify) break;
@@ -389,7 +443,6 @@ async function processProfile(profile, remainingNotify, state) {
         maxRetries: 10,
       });
     } catch (e) {
-      // ここで落とさずカテゴリ継続
       log(`keepaProduct failed for ${profile.name} (continue)`, e?.message || e);
       continue;
     }
@@ -414,6 +467,12 @@ async function processProfile(profile, remainingNotify, state) {
       const monthlySold = stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
       const price = newPrice ?? amazonPrice ?? null;
 
+      // ★ 2000円未満（価格不明含む）は除外（stateにも保存しない）
+      if (price == null || price < MIN_PRICE_YEN) {
+        skippedMinPrice += 1;
+        continue;
+      }
+
       const cur = {
         asin: p.asin,
         title: normalizeTitle(p.title),
@@ -426,31 +485,31 @@ async function processProfile(profile, remainingNotify, state) {
         imageUrl: getMainImageUrl(p),
       };
 
-      const prev = state.asins?.[cur.asin];
+      const prevFull = state.asins?.[cur.asin] || null;
+      const prevSlim = prevFull
+        ? { price: prevFull.price ?? null, sellers: prevFull.sellers ?? null, rank: prevFull.rank ?? null, sold30: prevFull.sold30 ?? null }
+        : null;
 
       // cooldown
-      if (prev && isInCooldown(prev)) {
+      if (prevFull && isInCooldown(prevFull)) {
         skippedCooldown += 1;
-        // stateは更新だけしておく（値は追従）
-        state.asins[cur.asin] = { ...prev, ...pickStateFields(cur), lastSeenAt: nowSec() };
+        state.asins[cur.asin] = { ...prevFull, ...pickStateFields(cur), lastSeenAt: nowSec() };
         continue;
       }
 
       // diff
-      const diff = shouldNotifyByDiff(prev, cur);
+      const diff = shouldNotifyByDiff(prevFull, cur);
       if (!diff.ok) {
         skippedNoDiff += 1;
-        // 通知しないが state は更新
-        state.asins[cur.asin] = { ...(prev || {}), ...pickStateFields(cur), lastSeenAt: nowSec() };
+        state.asins[cur.asin] = { ...(prevFull || {}), ...pickStateFields(cur), lastSeenAt: nowSec() };
         continue;
       }
 
-      // notify item
-      picked.push({ ...cur, diffReasons: diff.reasons });
+      picked.push({ ...cur, prev: prevSlim, diffReasons: diff.reasons });
 
-      // stateを通知済みに更新
+      // state更新（通知済み）
       state.asins[cur.asin] = {
-        ...(prev || {}),
+        ...(prevFull || {}),
         ...pickStateFields(cur),
         lastNotifiedAt: nowSec(),
         lastSeenAt: nowSec(),
@@ -462,14 +521,14 @@ async function processProfile(profile, remainingNotify, state) {
 
   if (!picked.length) {
     log(
-      `profile DONE ${profile.name} (no diff items) scanned=${scanned} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
+      `profile DONE ${profile.name} (no diff items) scanned=${scanned} minPriceSkip=${skippedMinPrice} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
     );
     return 0;
   }
 
   const sent = await postToSlack(profile.name, picked);
   log(
-    `profile DONE ${profile.name} notified=${sent} picked=${picked.length} scanned=${scanned} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
+    `profile DONE ${profile.name} notified=${sent} picked=${picked.length} scanned=${scanned} minPriceSkip=${skippedMinPrice} cooldownSkip=${skippedCooldown} noDiff=${skippedNoDiff}`
   );
   return sent;
 }
@@ -493,9 +552,11 @@ function pickStateFields(cur) {
 async function main() {
   log(`monitor START (ONLY_PROFILE=${ONLY_PROFILE || "all"})`);
 
-  // load state
   const state = loadState();
   if (!state.asins) state.asins = {};
+
+  // B: state掃除
+  cleanupState(state);
 
   let targets = PROFILES;
   if (ONLY_PROFILE) {
@@ -514,7 +575,6 @@ async function main() {
     totalNotified += used;
   }
 
-  // save state at end
   saveState(state);
 
   log(`monitor DONE notified=${totalNotified}`);
