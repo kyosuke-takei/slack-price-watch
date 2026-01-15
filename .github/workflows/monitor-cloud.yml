@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      ONLY_PROFILE: hobby
+      # ONLY_PROFILE を消す → 全カテゴリ（おもちゃ/ゲーム/ホビー）実行
       PROFILE_LIMIT: 30
       MAX_NOTIFY: 30
 
@@ -28,8 +28,14 @@ jobs:
       SOLD30_DELTA_ABS: 5
       NOTIFY_COOLDOWN_HOURS: 6
 
-      # state file path (repo root 기준)
+      # state file path
       STATE_FILE: cloud/data/state.json
+
+      # 2000円未満を弾く（デフォ2000だが明示しておく）
+      MIN_PRICE_YEN: 2000
+
+      # state cleanup（デフォ30だが明示）
+      STATE_TTL_DAYS: 30
 
       # secrets
       KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
@@ -54,13 +60,12 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cloud/data/state.json
-          key: state-${{ env.ONLY_PROFILE }}-${{ github.run_id }}
+          key: state-all-${{ github.run_id }}
           restore-keys: |
-            state-${{ env.ONLY_PROFILE }}-
+            state-all-
 
       - name: Show state existence
         run: |
-          echo "ONLY_PROFILE=$ONLY_PROFILE"
           ls -la cloud/data || true
           if [ -f cloud/data/state.json ]; then echo "state.json exists"; else echo "state.json missing"; fi
 
@@ -73,4 +78,4 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: cloud/data/state.json
-          key: state-${{ env.ONLY_PROFILE }}-${{ github.run_id }}
+          key: state-all-${{ github.run_id }}
