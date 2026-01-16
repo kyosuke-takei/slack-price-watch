@@ -2,7 +2,10 @@ name: slack-price-watch
 
 on:
   schedule:
-    - cron: "0 */3 * * *" # UTC。JSTにしたい場合は調整
+    - cron: "0 23 * * *" # JST 08:00
+    - cron: "0 3  * * *" # JST 12:00
+    - cron: "0 8  * * *" # JST 17:00
+    - cron: "0 11 * * *" # JST 20:00
   workflow_dispatch:
 
 jobs:
