@@ -2,10 +2,9 @@ name: slack-price-watch
 
 on:
   schedule:
-    - cron: "0 23 * * *" # JST 08:00
-    - cron: "0 3  * * *" # JST 12:00
-    - cron: "0 8  * * *" # JST 17:00
-    - cron: "0 11 * * *" # JST 20:00
+    # JST 08:00 / 12:00 / 17:00 / 20:00
+    # UTC = JST-9 => 23 / 03 / 08 / 11
+    - cron: "0 23,3,8,11 * * *"
   workflow_dispatch:
 
 jobs:
@@ -13,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # ONLY_PROFILE を消す → 全カテゴリ（おもちゃ/ゲーム/ホビー）実行
+      # 全カテゴリ（toys/games/hobby）実行するので ONLY_PROFILE は未指定
       PROFILE_LIMIT: 30
       MAX_NOTIFY: 30
 
@@ -25,20 +24,16 @@ jobs:
       STRICT_CATEGORY_MATCH: on
 
       # diff tuning
+      MIN_PRICE_YEN: 2000
       PRICE_DELTA_YEN: 200
       RANK_DELTA_ABS: 5000
       SELLERS_DELTA_ABS: 1
       SOLD30_DELTA_ABS: 5
       NOTIFY_COOLDOWN_HOURS: 6
+      STATE_TTL_DAYS: 30
 
       # state file path
       STATE_FILE: cloud/data/state.json
-
-      # 2000円未満を弾く（デフォ2000だが明示しておく）
-      MIN_PRICE_YEN: 2000
-
-      # state cleanup（デフォ30だが明示）
-      STATE_TTL_DAYS: 30
 
       # secrets
       KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
@@ -63,12 +58,14 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cloud/data/state.json
-          key: state-all-${{ github.run_id }}
+          # ブランチ別に分ける（mainだけで運用ならこのままでOK）
+          key: state-v1-${{ github.ref_name }}-${{ github.run_id }}
           restore-keys: |
-            state-all-
+            state-v1-${{ github.ref_name }}-
 
       - name: Show state existence
         run: |
+          echo "STATE_FILE=$STATE_FILE"
           ls -la cloud/data || true
           if [ -f cloud/data/state.json ]; then echo "state.json exists"; else echo "state.json missing"; fi
 
@@ -78,7 +75,8 @@ jobs:
 
       # --- Save state.json to cache for next run ---
       - name: Save state cache
+        if: always()
         uses: actions/cache/save@v4
         with:
           path: cloud/data/state.json
-          key: state-all-${{ github.run_id }}
+          key: state-v1-${{ github.ref_name }}-${{ github.run_id }}
