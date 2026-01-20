@@ -3,7 +3,7 @@ name: slack-price-watch
 on:
   schedule:
     # JST 08:00 / 12:00 / 17:00 / 20:00
-    # UTC = JST-9 => 23 / 03 / 08 / 11
+    # UTC = JST - 9 => 23 / 03 / 08 / 11
     - cron: "0 23,3,8,11 * * *"
   workflow_dispatch:
 
@@ -12,7 +12,9 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # 全カテゴリ（toys/games/hobby）実行するので ONLY_PROFILE は未指定
+      # 全カテゴリ（toys/games/hobby）実行するので未指定
+      # ONLY_PROFILE: hobby
+
       PROFILE_LIMIT: 30
       MAX_NOTIFY: 30
 
@@ -24,16 +26,14 @@ jobs:
       STRICT_CATEGORY_MATCH: on
 
       # diff tuning
-      MIN_PRICE_YEN: 2000
       PRICE_DELTA_YEN: 200
       RANK_DELTA_ABS: 5000
       SELLERS_DELTA_ABS: 1
       SOLD30_DELTA_ABS: 5
       NOTIFY_COOLDOWN_HOURS: 6
-      STATE_TTL_DAYS: 30
 
-      # state file path
-      STATE_FILE: cloud/data/state.json
+      # ★重要：monitorは working-directory: cloud で動くので cloud基準の相対パスにする
+      STATE_FILE: data/state.json
 
       # secrets
       KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
@@ -58,14 +58,13 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cloud/data/state.json
-          # ブランチ別に分ける（mainだけで運用ならこのままでOK）
-          key: state-v1-${{ github.ref_name }}-${{ github.run_id }}
+          key: state-v1-${{ github.run_id }}
           restore-keys: |
-            state-v1-${{ github.ref_name }}-
+            state-v1-
 
-      - name: Show state existence
+      - name: Show state existence (before run)
         run: |
-          echo "STATE_FILE=$STATE_FILE"
+          echo "ONLY_PROFILE=$ONLY_PROFILE"
           ls -la cloud/data || true
           if [ -f cloud/data/state.json ]; then echo "state.json exists"; else echo "state.json missing"; fi
 
@@ -73,10 +72,16 @@ jobs:
         run: npm run monitor
         working-directory: cloud
 
+      # --- Debug: locate state.json anywhere (after run) ---
+      - name: Debug - locate state.json
+        run: |
+          echo "pwd=$(pwd)"
+          echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
+          find . -maxdepth 4 -name "state.json" -print -ls || true
+
       # --- Save state.json to cache for next run ---
       - name: Save state cache
-        if: always()
         uses: actions/cache/save@v4
         with:
           path: cloud/data/state.json
-          key: state-v1-${{ github.ref_name }}-${{ github.run_id }}
+          key: state-v1-${{ github.run_id }}
