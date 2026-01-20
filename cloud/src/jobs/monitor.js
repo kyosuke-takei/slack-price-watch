@@ -6,6 +6,7 @@
 // - Per-profile notify limit: MAX_NOTIFY_PER_PROFILE
 // - 429 Too Many Requests: wait refillIn then retry
 // - Slack payload: { text, blocks } using existing slack() exporter
+// - Slack shows readable diffs with arrows
 
 import "dotenv/config";
 import fs from "node:fs";
@@ -94,14 +95,23 @@ function yen(v) {
   if (v == null) return "-";
   return `${Number(v).toLocaleString("ja-JP")}円`;
 }
-function absNum(n) {
-  return typeof n === "number" ? Math.abs(n) : null;
+function fmtSigned(n, unit = "") {
+  if (n == null || !Number.isFinite(n)) return "-";
+  const sign = n > 0 ? "+" : "";
+  return `${sign}${n.toLocaleString("ja-JP")}${unit}`;
+}
+function arrowUpDown(delta, { invert = false } = {}) {
+  // invert=true: smaller is better (rank)
+  if (delta == null || !Number.isFinite(delta) || delta === 0) return "";
+  const up = invert ? "🔺" : "🔺";
+  const down = invert ? "🔻" : "🔻";
+  // rank: delta<0 is improvement => 🔻
+  if (invert) return delta < 0 ? down : up;
+  return delta > 0 ? up : down;
 }
 
 /* =========================
- * STATE_FILE resolve (✅重要)
- * - STATE_FILE が相対なら「リポジトリルート基準」に解決する
- *   (Actions: GITHUB_WORKSPACE, ローカル: cwdがcloudなら..)
+ * STATE_FILE resolve
  * ========================= */
 function guessRepoRoot() {
   const ws = process.env.GITHUB_WORKSPACE;
@@ -140,20 +150,7 @@ function writeJsonAtomic(filePath, obj) {
 
 /* =========================
  * state
- * =========================
- * {
- *   version: 1,
- *   updatedAt: number(ms),
- *   asins: {
- *     [asin]: {
- *       asin, title,
- *       price, rank, sellers, sold30,
- *       firstSeenAt, lastSeenAt,
- *       lastNotifiedAt
- *     }
- *   }
- * }
- */
+ * ========================= */
 function loadState() {
   const base = { version: 1, updatedAt: 0, asins: {} };
   const st = readJsonSafe(STATE_FILE, base);
@@ -187,7 +184,6 @@ function saveState(state) {
 /* =========================
  * Keepa helpers
  * ========================= */
-// Keepa stats.current: [amazon, new, used, salesRank, ...]
 function getStatsBasics(stats = {}) {
   const current = Array.isArray(stats.current) ? stats.current : [];
   const amazonRaw = current[0];
@@ -284,57 +280,51 @@ async function fetchAsinsForProfile(profile) {
 }
 
 /* =========================
- * diff & cooldown
+ * diff & cooldown (B: visible diffs)
  * ========================= */
-function buildDiff(prev, curr) {
-  if (!prev) return { changed: true, label: "NEW" };
+function buildDiffLabel(prev, curr) {
+  if (!prev) return { changed: true, label: "🆕 NEW" };
 
   const parts = [];
-  let changed = false;
 
   // price
   if (curr.price != null && prev.price != null) {
     const d = curr.price - prev.price;
-    if (absNum(d) != null && absNum(d) >= PRICE_DELTA_YEN) {
-      changed = true;
-      parts.push(`価格 ${d > 0 ? "+" : ""}${d.toLocaleString("ja-JP")}円`);
+    if (Math.abs(d) >= PRICE_DELTA_YEN) {
+      parts.push(`${arrowUpDown(d)} 価格 ${fmtSigned(d, "円")}`);
     }
   } else if (curr.price != null && prev.price == null) {
-    changed = true;
-    parts.push(`価格 - → ${yen(curr.price)}`);
+    parts.push(`🔺 価格 - → ${yen(curr.price)}`);
   } else if (curr.price == null && prev.price != null) {
-    changed = true;
-    parts.push(`価格 ${yen(prev.price)} → -`);
+    parts.push(`🔻 価格 ${yen(prev.price)} → -`);
   }
 
-  // rank
+  // rank (smaller is better)
   if (curr.rank != null && prev.rank != null) {
     const d = curr.rank - prev.rank;
-    if (absNum(d) != null && absNum(d) >= RANK_DELTA_ABS) {
-      changed = true;
-      parts.push(`ランク ${d > 0 ? "+" : ""}${d.toLocaleString("ja-JP")}`);
+    if (Math.abs(d) >= RANK_DELTA_ABS) {
+      // rank improved when d < 0
+      parts.push(`${arrowUpDown(d, { invert: true })} ランク ${fmtSigned(d)}`);
     }
   }
 
   // sellers
   if (curr.sellers != null && prev.sellers != null) {
     const d = curr.sellers - prev.sellers;
-    if (absNum(d) != null && absNum(d) >= SELLERS_DELTA_ABS) {
-      changed = true;
-      parts.push(`出品者 ${d > 0 ? "+" : ""}${d}`);
+    if (Math.abs(d) >= SELLERS_DELTA_ABS) {
+      parts.push(`${arrowUpDown(d)} 出品者 ${fmtSigned(d)}`);
     }
   }
 
   // sold30
   if (curr.sold30 != null && prev.sold30 != null) {
     const d = curr.sold30 - prev.sold30;
-    if (absNum(d) != null && absNum(d) >= SOLD30_DELTA_ABS) {
-      changed = true;
-      parts.push(`30日販売数 ${d > 0 ? "+" : ""}${d}`);
+    if (Math.abs(d) >= SOLD30_DELTA_ABS) {
+      parts.push(`${arrowUpDown(d)} 30日販売 ${fmtSigned(d)}`);
     }
   }
 
-  if (!changed) return { changed: false, label: "NO_DIFF" };
+  if (!parts.length) return { changed: false, label: "NO_DIFF" };
   return { changed: true, label: parts.join(" / ") };
 }
 
@@ -345,7 +335,7 @@ function inCooldown(prev) {
 }
 
 /* =========================
- * Slack blocks (既存slack.js互換: {text, blocks})
+ * Slack blocks
  * ========================= */
 function buildBlocks(profileName, it) {
   const blocks = [];
@@ -405,7 +395,6 @@ async function postToSlack(profileName, items) {
   for (const group of groups) {
     const blocks = [];
     for (const it of group) blocks.push(...buildBlocks(profileName, it));
-
     const fallback = `${profileName}: ${group[0].title?.slice(0, 60) || group[0].asin} ほか${group.length}件`;
 
     try {
@@ -475,15 +464,12 @@ async function processProfile(profile, state) {
       const stats = p.stats || {};
       const { amazonPrice, newPrice, salesRank } = getStatsBasics(stats);
 
-      // Amazon在庫があるものは除外
       if (amazonPrice && amazonPrice > 0) continue;
 
       const sellers = getTotalOfferCount(stats);
       if (sellers == null || sellers < 3) continue;
 
-      const monthlySold =
-        stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
-
+      const monthlySold = stats.salesRankDrops30 ?? stats.salesRankDrops90 ?? stats.salesRankDrops180 ?? null;
       const price = newPrice ?? amazonPrice ?? null;
 
       // ✅ 取得時点で 2000円未満は弾く（stateにも保存しない）
@@ -505,7 +491,7 @@ async function processProfile(profile, state) {
         imageUrl: getMainImageUrl(p),
       };
 
-      const diff = buildDiff(prev, curr);
+      const diff = buildDiffLabel(prev, curr);
 
       // state更新（2000円以上だけが残る仕様）
       state.asins[asin] = {
@@ -562,7 +548,6 @@ async function main() {
 
   const state = loadState();
 
-  // 初回でも必ずファイルを作る（cache/saveの対象を確実に存在させる）
   if (!fs.existsSync(STATE_FILE)) {
     writeJsonAtomic(STATE_FILE, state);
     log("state file created", { file: path.relative(guessRepoRoot(), STATE_FILE) });
