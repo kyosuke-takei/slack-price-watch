@@ -3,7 +3,7 @@ name: slack-price-watch
 on:
   schedule:
     # JST 08:00 / 12:00 / 17:00 / 20:00
-    # UTC = JST - 9 => 23 / 03 / 08 / 11
+    # UTC = JST - 9 => 23:00 / 03:00 / 08:00 / 11:00
     - cron: "0 23,3,8,11 * * *"
   workflow_dispatch:
 
@@ -12,12 +12,14 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # 全カテゴリ（toys/games/hobby）実行するので未指定
-      # ONLY_PROFILE: hobby
+      # all / toys / games / hobby
+      ONLY_PROFILE: all
 
+      # per profile limit
       PROFILE_LIMIT: 30
-      MAX_NOTIFY: 30
+      MAX_NOTIFY_PER_PROFILE: 30
 
+      # finder tuning
       FINDER_PER_PAGE: 100
       FINDER_MAX_PAGES: 5
       SLACK_BATCH: 3
@@ -32,8 +34,11 @@ jobs:
       SOLD30_DELTA_ABS: 5
       NOTIFY_COOLDOWN_HOURS: 6
 
-      # ★重要：monitorは working-directory: cloud で動くので cloud基準の相対パスにする
-      STATE_FILE: data/state.json
+      # price floor (optional)
+      MIN_PRICE_YEN: 2000
+
+      # ✅ state path (repo root 기준)
+      STATE_FILE: cloud/data/state.json
 
       # secrets
       KEEPA_API_KEY: ${{ secrets.KEEPA_API_KEY }}
@@ -48,6 +53,8 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
 
       - name: Install deps
         run: npm ci
@@ -58,30 +65,49 @@ jobs:
         uses: actions/cache/restore@v4
         with:
           path: cloud/data/state.json
-          key: state-v1-${{ github.run_id }}
+          key: state-${{ github.run_id }}
           restore-keys: |
-            state-v1-
+            state-
 
-      - name: Show state existence (before run)
-        run: |
-          echo "ONLY_PROFILE=$ONLY_PROFILE"
-          ls -la cloud/data || true
-          if [ -f cloud/data/state.json ]; then echo "state.json exists"; else echo "state.json missing"; fi
-
-      - name: Run monitor
-        run: npm run monitor
-        working-directory: cloud
-
-      # --- Debug: locate state.json anywhere (after run) ---
+      # ✅ Debug step (あなた指定のやつ)
       - name: Debug - locate state.json
         run: |
           echo "pwd=$(pwd)"
           echo "GITHUB_WORKSPACE=$GITHUB_WORKSPACE"
           find . -maxdepth 4 -name "state.json" -print -ls || true
 
+      - name: Debug - show state target
+        run: |
+          echo "STATE_FILE=$STATE_FILE"
+          ls -la cloud || true
+          ls -la cloud/data || true
+          if [ -f cloud/data/state.json ]; then
+            echo "cloud/data/state.json exists"
+            wc -c cloud/data/state.json || true
+          else
+            echo "cloud/data/state.json missing"
+          fi
+
+      - name: Run monitor
+        run: npm run monitor
+        working-directory: cloud
+
+      - name: Debug - after monitor
+        run: |
+          echo "After monitor:"
+          find . -maxdepth 4 -name "state.json" -print -ls || true
+          ls -la cloud/data || true
+          if [ -f cloud/data/state.json ]; then
+            echo "cloud/data/state.json size:"
+            wc -c cloud/data/state.json || true
+            echo "cloud/data/state.json head:"
+            head -c 500 cloud/data/state.json || true
+            echo ""
+          fi
+
       # --- Save state.json to cache for next run ---
       - name: Save state cache
         uses: actions/cache/save@v4
         with:
           path: cloud/data/state.json
-          key: state-v1-${{ github.run_id }}
+          key: state-${{ github.run_id }}
